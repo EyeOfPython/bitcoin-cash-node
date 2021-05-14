@@ -1,0 +1,2 @@
+void StartPluginGrpc();
+void StopPluginGrpc();
