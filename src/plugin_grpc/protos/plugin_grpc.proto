@@ -1,0 +1,183 @@
+syntax = "proto3";
+
+package plugin_grpc;
+
+service NodeInterface {
+    rpc Messages(MessageSubscribeTo) returns (stream Message);
+    rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+    rpc GetBlockUndoData(GetBlockUndoDataRequest) returns (GetBlockUndoDataResponse);
+    rpc GetMempool(GetMempoolRequest) returns (GetMempoolResponse);
+}
+
+message MessageSubscribeTo {
+    bool updated_block_tip = 1;
+    bool transaction_added_to_mempool = 2;
+    bool transaction_removed_from_mempool = 3;
+    bool block_connected = 4;
+    bool block_disconnected = 5;
+    bool chain_state_flushed = 6;
+    bool block_checked = 7;
+    bool new_pow_valid_block = 8;
+}
+
+message Message {
+    oneof message {
+        UpdatedBlockTip updated_block_tip = 1;
+        TransactionAddedToMempool transaction_added_to_mempool = 2;
+        TransactionRemovedFromMempool transaction_removed_from_mempool = 3;
+        BlockConnected block_connected = 4;
+        BlockDisconnected block_disconnected = 5;
+        ChainStateFlushed chain_state_flushed = 6;
+        BlockChecked block_checked = 7;
+        NewPoWValidBlock new_pow_valid_block = 8;
+    }
+}
+
+message Block {
+    bytes header = 1;
+    repeated BlockMetadata metadata = 2;
+    repeated bytes txs = 3;
+}
+
+message Coin {
+    uint64 amount = 1;
+    bytes script = 2;
+    int32 height = 3;
+    bool is_coinbase = 4;
+}
+
+message BlockMetadata {
+    uint32 field_id = 1;
+    bytes field_value = 2;
+}
+
+message BlockIdentifier {
+    oneof id {
+        int32 height = 1;
+        bytes blockhash = 2;
+    }
+}
+
+// Notifies listeners when the block chain tip advances.
+//
+// When multiple blocks are connected at once, UpdatedBlockTip will be
+// sent on the final tip but may not be sent on every intermediate tip.
+// If the latter behavior is desired, subscribe to BlockConnected instead.
+message UpdatedBlockTip {
+    // Hash of the block that's now tip
+    bytes blockhash = 1;
+}
+
+// Notifies listeners of a transaction having been added to mempool.
+message TransactionAddedToMempool {
+    // Encoded transaction
+    bytes tx = 1;
+}
+
+// Notifies listeners of a transaction leaving mempool.
+//
+// This notification gets sent for transactions that are removed from the
+// mempool for the following reasons:
+//
+// - EXPIRY (expired from mempool after -mempoolexpiry hours)
+// - SIZELIMIT (removed in size limiting if the mempool exceeds -maxmempool
+//   megabytes)
+// - REORG (removed during a reorg)
+// - CONFLICT (removed because it conflicts with in-block transaction)
+//
+// This does not get sent for transactions that are removed from the mempool
+// because they have been included in a block. Any client that is interested
+// in transactions removed from the mempool for inclusion in a block can
+// learn about those transactions from the BlockConnected notification.
+//
+// Transactions that are removed from the mempool because they conflict
+// with a transaction in the new block will have
+// TransactionRemovedFromMempool messages sent //before// the BlockConnected
+// message is sent. If multiple blocks are connected in one step, then the
+// ordering could be:
+//
+// - TransactionRemovedFromMempool(tx1 from block A)
+// - TransactionRemovedFromMempool(tx2 from block A)
+// - TransactionRemovedFromMempool(tx1 from block B)
+// - TransactionRemovedFromMempool(tx2 from block B)
+// - BlockConnected(A)
+// - BlockConnected(B)
+message TransactionRemovedFromMempool {
+    bytes txid = 1;
+}
+
+// Notifies listeners of a block being connected.
+// Provides a vector of transactions evicted from the mempool as a result.
+message BlockConnected {
+    bytes blockheader = 1;
+    repeated BlockMetadata metadata = 2;
+    repeated bytes txids = 3;
+}
+
+// Notifies listeners of a block being disconnected
+message BlockDisconnected {
+    bytes blockhash = 1;
+}
+
+// Notifies listeners of the new active block chain on-disk.
+//
+// Prior to this message, any updates are not guaranteed to persist on disk
+// (ie clients need to handle shutdown/restart safety by being able to
+// understand when some updates were lost due to unclean shutdown).
+//
+// When this message is sent, the validation changes done by any prior
+// message are guaranteed to exist on disk and survive a restart, including
+// an unclean shutdown.
+//
+// Provides a locator describing the best chain, which is likely useful for
+// storing current state on disk in client DBs.
+message ChainStateFlushed {
+    bytes blockhash = 1;
+}
+
+// Notifies listeners of a block validation result.
+// If the provided BlockValidationState IsValid, the provided block
+// is guaranteed to be the current best block at the time the
+// callback was generated (not necessarily now)
+message BlockChecked {
+    bytes blockhash = 1;
+    BlockValidationState validation_state = 2;
+}
+
+message BlockValidationState {
+    string state = 1;
+    string reason = 2;
+}
+
+// Notifies listeners that a block which builds directly on our current tip
+// has been received and connected to the headers tree, though not validated
+// yet.
+message NewPoWValidBlock {
+    bytes blockheader = 1;
+}
+
+message GetBlockRequest {
+    BlockIdentifier block_id = 1;
+}
+
+message GetBlockResponse {
+    Block block = 1;
+}
+
+message GetBlockUndoDataRequest {
+    BlockIdentifier block_id = 1;
+}
+
+message GetBlockUndoDataResponse {
+    repeated Coin coins = 1; 
+}
+
+message GetMempoolRequest {}
+
+message GetMempoolResponse {
+    repeated MempoolTx txs = 1;
+}
+
+message MempoolTx {
+    bytes tx = 1;
+}

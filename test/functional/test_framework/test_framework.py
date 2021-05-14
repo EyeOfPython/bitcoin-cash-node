@@ -159,6 +159,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             config['environment']['BUILDDIR'] + os.path.sep + "qt" + os.pathsep + \
             os.environ['PATH']
 
+        sys.path.append(config["environment"]["BUILDDIR"] + '/src/plugin_grpc')
+
         # Set up temp directory and start logging
         if self.options.tmpdir:
             self.options.tmpdir = os.path.abspath(self.options.tmpdir)
@@ -575,6 +577,13 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             import zmq  # noqa
         except ImportError:
             raise SkipTest("python3-zmq module not available.")
+
+    def skip_if_no_py3_grpc(self):
+        """Attempt to import the grpc package and skip the test if the import fails."""
+        try:
+            import grpc  # noqa
+        except ImportError:
+            raise SkipTest("grpcio module not available.")
 
     def skip_if_no_bitcoind_zmq(self):
         """Skip the running test if bitcoind has not been compiled with zmq support."""
