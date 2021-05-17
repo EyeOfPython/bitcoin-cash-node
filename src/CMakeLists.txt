@@ -12,6 +12,7 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 option(BUILD_BITCOIN_WALLET "Activate the wallet functionality" ON)
 option(BUILD_BITCOIN_ZMQ "Activate the ZeroMQ functionalities" ON)
+option(BUILD_BITCOIN_PLUGIN_NNG "Activate the Plugin NNG functionalities" ON)
 option(BUILD_BITCOIN_SEEDER "Build bitcoin-seeder" ON)
 option(BUILD_BITCOIN_CLI "Build bitcoin-cli" ON)
 option(BUILD_BITCOIN_TX "Build bitcoin-tx" ON)
@@ -49,6 +50,7 @@ native_add_cmake_flags(
 	"-DBUILD_BITCOIN_WALLET=OFF"
 	"-DBUILD_BITCOIN_QT=OFF"
 	"-DBUILD_BITCOIN_ZMQ=OFF"
+	"-BUILD_BITCOIN_PLUGIN_NNG=OFF"
 	"-DENABLE_QRCODE=OFF"
 	"-DENABLE_UPNP=OFF"
 	# Forward the current setting for clang-tidy
@@ -588,6 +590,11 @@ endif()
 if(BUILD_BITCOIN_ZMQ)
 	add_subdirectory(zmq)
 	target_link_libraries(server zmq)
+endif()
+
+if(BUILD_BITCOIN_PLUGIN_NNG)
+	add_subdirectory(plugin_nng)
+	target_link_libraries(server plugin_nng)
 endif()
 
 # RPC client support

@@ -37,6 +37,7 @@
 #include <netbase.h>
 #include <policy/mempool.h>
 #include <policy/policy.h>
+#include <plugin_nng/plugin_nng.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
 #include <rpc/server.h>
@@ -240,6 +241,8 @@ void Shutdown(NodeContext &node) {
     if (g_txindex) {
         g_txindex->Stop();
     }
+
+    StopPluginNng();
 
     StopTorControl();
 
@@ -2649,6 +2652,8 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
         g_txindex = std::make_unique<TxIndex>(nTxIndexCache, false, fReindex);
         g_txindex->Start();
     }
+
+    StartPluginNng();
 
     // Step 9: load wallet
     for (const auto &client : node.chain_clients) {

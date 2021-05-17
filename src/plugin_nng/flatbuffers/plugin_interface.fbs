@@ -1,0 +1,200 @@
+namespace PluginInterface;
+
+table MessageSubscribeTo {
+    updated_block_tip: bool;
+    transaction_added_to_mempool: bool;
+    transaction_removed_from_mempool: bool;
+    block_connected: bool;
+    block_disconnected: bool;
+    chain_state_flushed: bool;
+    block_checked: bool;
+    new_pow_valid_block: bool;
+}
+
+union MessageType {
+    UpdatedBlockTip,
+    TransactionAddedToMempool,
+    TransactionRemovedFromMempool,
+    BlockConnected,
+    BlockDisconnected,
+    ChainStateFlushed,
+    BlockChecked,
+    NewPoWValidBlock,
+}
+
+union RpcType {
+    GetBlockRequest,
+    GetBlockUndoDataRequest,
+    GetMempoolRequest,
+}
+
+table RpcResult {
+    is_success: bool;
+    error_msg: string;
+    data: [ubyte];
+}
+
+table Message {
+    message: MessageType;
+}
+
+table Rpc {
+    rpc: RpcType;
+}
+
+table Tx {
+    raw: [ubyte];
+}
+
+table Block {
+    header: [ubyte];
+    metadata: [BlockMetadata];
+    txs: [Tx];
+}
+
+table Coin {
+    amount: uint64;
+    script: [ubyte];
+    height: int32;
+    is_coinbase: bool;
+}
+
+table BlockMetadata {
+    field_id: uint32;
+    field_value: [ubyte];
+}
+
+table BlockHeight {
+    height: int32;
+}
+
+table BlockHash {
+    blockhash: [ubyte];
+}
+
+union BlockIdentifier {
+    Height: BlockHeight,
+    Blockhash: BlockHash,
+}
+
+// Notifies listeners when the block chain tip advances.
+//
+// When multiple blocks are connected at once, UpdatedBlockTip will be
+// sent on the final tip but may not be sent on every intermediate tip.
+// If the latter behavior is desired, subscribe to BlockConnected instead.
+table UpdatedBlockTip {
+    // Hash of the block that's now tip
+    blockhash: [ubyte];
+}
+
+// Notifies listeners of a transaction having been added to mempool.
+table TransactionAddedToMempool {
+    // Encoded transaction
+    tx: Tx;
+}
+
+// Notifies listeners of a transaction leaving mempool.
+//
+// This notification gets sent for transactions that are removed from the
+// mempool for the following reasons:
+//
+// - EXPIRY (expired from mempool after -mempoolexpiry hours)
+// - SIZELIMIT (removed in size limiting if the mempool exceeds -maxmempool
+//   megabytes)
+// - REORG (removed during a reorg)
+// - CONFLICT (removed because it conflicts with in-block transaction)
+//
+// This does not get sent for transactions that are removed from the mempool
+// because they have been included in a block. Any client that is interested
+// in transactions removed from the mempool for inclusion in a block can
+// learn about those transactions from the BlockConnected notification.
+//
+// Transactions that are removed from the mempool because they conflict
+// with a transaction in the new block will have
+// TransactionRemovedFromMempool messages sent //before// the BlockConnected
+// message is sent. If multiple blocks are connected in one step, then the
+// ordering could be:
+//
+// - TransactionRemovedFromMempool(tx1 from block A)
+// - TransactionRemovedFromMempool(tx2 from block A)
+// - TransactionRemovedFromMempool(tx1 from block B)
+// - TransactionRemovedFromMempool(tx2 from block B)
+// - BlockConnected(A)
+// - BlockConnected(B)
+table TransactionRemovedFromMempool {
+    txid: [ubyte];
+}
+
+// Notifies listeners of a block being connected.
+// Provides a vector of transactions evicted from the mempool as a result.
+table BlockConnected {
+    block: Block;
+}
+
+// Notifies listeners of a block being disconnected
+table BlockDisconnected {
+    blockhash: [ubyte];
+}
+
+// Notifies listeners of the new active block chain on-disk.
+//
+// Prior to this message, any updates are not guaranteed to persist on disk
+// (ie clients need to handle shutdown/restart safety by being able to
+// understand when some updates were lost due to unclean shutdown).
+//
+// When this message is sent, the validation changes done by any prior
+// message are guaranteed to exist on disk and survive a restart, including
+// an unclean shutdown.
+//
+// Provides a locator describing the best chain, which is likely useful for
+// storing current state on disk in client DBs.
+table ChainStateFlushed {
+    blockhash: [ubyte];
+}
+
+// Notifies listeners of a block validation result.
+// If the provided BlockValidationState IsValid, the provided block
+// is guaranteed to be the current best block at the time the
+// callback was generated (not necessarily now)
+table BlockChecked {
+    blockhash: [ubyte];
+    validation_state: BlockValidationState;
+}
+
+table BlockValidationState {
+    state: string;
+    reason: string;
+}
+
+// Notifies listeners that a block which builds directly on our current tip
+// has been received and connected to the headers tree, though not validated
+// yet.
+table NewPoWValidBlock {
+    blockheader: [ubyte];
+}
+
+table GetBlockRequest {
+    block_id: BlockIdentifier;
+}
+
+table GetBlockResponse {
+    block: Block;
+}
+
+table GetBlockUndoDataRequest {
+    block_id: BlockIdentifier;
+}
+
+table GetBlockUndoDataResponse {
+    coins: [Coin]; 
+}
+
+table GetMempoolRequest {}
+
+table GetMempoolResponse {
+    txs: [MempoolTx];
+}
+
+table MempoolTx {
+    tx: [ubyte];
+}
