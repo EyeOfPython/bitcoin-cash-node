@@ -1156,6 +1156,18 @@ void SetupServerArgs() {
                  strprintf("Timeout during HTTP requests (default: %d)",
                            DEFAULT_HTTP_SERVER_TIMEOUT),
                  true, OptionsCategory::RPC);
+    gArgs.AddArg(
+        "-pluginrpcurl=<url>",
+        "Bind to given url to listen for NNG plugin RPC connections. URL "
+        "has to be prefixed by tcp:// or ipc://, which also "
+        "determines the transport that will be used",
+        false, OptionsCategory::PLUGIN_INTERFACE);
+    gArgs.AddArg(
+        "-pluginpuburl=<url>",
+        "Bind to given url to listen for NNG plugin Pubsub connections. URL "
+        "has to be prefixed by tcp:// or ipc://, which also "
+        "determines the transport that will be used",
+        false, OptionsCategory::PLUGIN_INTERFACE);
 
 #if HAVE_DECL_DAEMON
     gArgs.AddArg("-daemon",

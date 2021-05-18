@@ -19,8 +19,10 @@
 #include <sync.h>
 #include <txmempool.h>
 #include <undo.h>
+#include <util/system.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <logging.h>
 
 #include "plugin_interface_generated.h"
 
@@ -361,11 +363,11 @@ public:
 private:
     nng_socket m_sock;
 
-    void BroadcastMessage(const std::string prefix,
+    void BroadcastMessage(const std::string msg_type,
                           const flatbuffers::FlatBufferBuilder &fbb) {
         std::vector<uint8_t> msg;
         msg.resize(12 + fbb.GetSize());
-        memcpy(msg.data(), prefix.data(), prefix.size());
+        memcpy(msg.data(), msg_type.data(), msg_type.size());
         memcpy(msg.data() + 12, fbb.GetBufferPointer(), fbb.GetSize());
         NNG_TRY(nng_send(m_sock, msg.data(), msg.size(), 0));
     }
@@ -468,21 +470,31 @@ private:
 };
 
 std::thread g_rpc_thread;
+bool has_rpc = false;
 std::unique_ptr<PluginRpcServer> g_rpc_server;
 std::unique_ptr<PluginPubServer> g_pub_server;
 
 void RunServer() {
-    g_rpc_server = std::make_unique<PluginRpcServer>(GetConfig());
-    g_rpc_server->Serve("tcp://127.0.0.1:5000");
+    std::string rpc_url = gArgs.GetArg("-pluginrpcurl", "");
+    if (rpc_url.size() > 0) {
+        has_rpc = true;
+        g_rpc_server = std::make_unique<PluginRpcServer>(GetConfig());
+        g_rpc_server->Serve(rpc_url);
+    }
 }
 
 void StartPluginNng() {
     g_rpc_thread = std::thread(RunServer);
-    g_pub_server = std::make_unique<PluginPubServer>();
-    g_pub_server->Listen("tcp://127.0.0.1:5001");
+    std::string pub_url = gArgs.GetArg("-pluginpuburl", "");
+    if (pub_url.size() > 0) {
+        g_pub_server = std::make_unique<PluginPubServer>();
+        g_pub_server->Listen(pub_url);
+    }
 }
 
 void StopPluginNng() {
-    g_rpc_server->Shutdown();
+    if (has_rpc) {
+        g_rpc_server->Shutdown();
+    }
     g_rpc_thread.join();
 }

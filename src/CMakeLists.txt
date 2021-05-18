@@ -50,7 +50,7 @@ native_add_cmake_flags(
 	"-DBUILD_BITCOIN_WALLET=OFF"
 	"-DBUILD_BITCOIN_QT=OFF"
 	"-DBUILD_BITCOIN_ZMQ=OFF"
-	"-BUILD_BITCOIN_PLUGIN_NNG=OFF"
+	"-DBUILD_BITCOIN_PLUGIN_NNG=OFF"
 	"-DENABLE_QRCODE=OFF"
 	"-DENABLE_UPNP=OFF"
 	# Forward the current setting for clang-tidy
