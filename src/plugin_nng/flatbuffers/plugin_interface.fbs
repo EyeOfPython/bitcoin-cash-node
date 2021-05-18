@@ -11,18 +11,7 @@ table MessageSubscribeTo {
     new_pow_valid_block: bool;
 }
 
-union MessageType {
-    UpdatedBlockTip,
-    TransactionAddedToMempool,
-    TransactionRemovedFromMempool,
-    BlockConnected,
-    BlockDisconnected,
-    ChainStateFlushed,
-    BlockChecked,
-    NewPoWValidBlock,
-}
-
-union RpcType {
+union RpcCallType {
     GetBlockRequest,
     GetBlockUndoDataRequest,
     GetMempoolRequest,
@@ -30,20 +19,21 @@ union RpcType {
 
 table RpcResult {
     is_success: bool;
+    error_code: int32;
     error_msg: string;
     data: [ubyte];
 }
 
-table Message {
-    message: MessageType;
-}
-
-table Rpc {
-    rpc: RpcType;
+table RpcCall {
+    rpc: RpcCallType;
 }
 
 table Tx {
     raw: [ubyte];
+}
+
+struct Txid {
+    id: [ubyte: 32];
 }
 
 table Block {
@@ -129,6 +119,7 @@ table TransactionRemovedFromMempool {
 // Provides a vector of transactions evicted from the mempool as a result.
 table BlockConnected {
     block: Block;
+    txs_conflicted: [Txid];
 }
 
 // Notifies listeners of a block being disconnected
@@ -161,9 +152,16 @@ table BlockChecked {
     validation_state: BlockValidationState;
 }
 
+enum BlockValidationModeState : uint8 {
+    Valid,
+    Invalid,
+    Error,
+}
+
 table BlockValidationState {
-    state: string;
-    reason: string;
+    state: BlockValidationModeState;
+    reject_reason: string;
+    debug_msg: string;
 }
 
 // Notifies listeners that a block which builds directly on our current tip

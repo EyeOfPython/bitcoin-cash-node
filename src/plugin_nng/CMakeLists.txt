@@ -23,6 +23,7 @@ add_custom_command(
   ARGS -o "${genflatbuf_folder}"
     --cpp
     --python
+    --gen-mutable
     "${flatbuffers_file}"
   DEPENDS "${flatbuffers_file}")
 

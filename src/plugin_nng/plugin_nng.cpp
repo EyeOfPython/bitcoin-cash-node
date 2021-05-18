@@ -1,10 +1,11 @@
+#include <iostream>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <iostream>
 
 #include <nng/nng.h>
+#include <nng/protocol/pubsub0/pub.h>
 #include <nng/protocol/reqrep0/rep.h>
 #include <nng/supplemental/util/platform.h>
 
@@ -13,6 +14,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <config.h>
+#include <consensus/validation.h>
 #include <streams.h>
 #include <sync.h>
 #include <txmempool.h>
@@ -22,24 +24,212 @@
 
 #include "plugin_interface_generated.h"
 
-#ifndef PARALLEL
-#define PARALLEL 128
-#endif
-
-struct work {
-    enum { INIT, RECV, WAIT, SEND } state;
-    nng_aio *aio;
-    nng_msg *msg;
-    nng_ctx ctx;
+enum class PluginRpcWorkerState {
+    UNINIT,
+    RECV,
+    SEND,
 };
 
-void fatal(const char *func, int rv) {
-    fprintf(stderr, "%s: %s\n", func, nng_strerror(rv));
-    exit(1);
+class PluginRpcServer;
+
+#define NNG_TRY(call)                                                          \
+    do {                                                                       \
+        int rv = (call);                                                       \
+        if (rv != 0) {                                                         \
+            fprintf(stderr, "NNG Error: %s\n  at %s:%d: %s\n",                 \
+                    nng_strerror(rv), __FILE__, __LINE__, #call);              \
+            exit(1);                                                           \
+        }                                                                      \
+    } while (false)
+
+enum RpcErrorCode {
+    NO_ERROR = 0,
+    NNG_ERROR,
+    INVALID_FLATBUFFER_ENCODING,
+    UNKNOWN_RPC_METHOD,
+    BLOCK_ID_UNKNOWN_TYPE,
+    BLOCKHASH_INVALID_SIZE,
+    BLOCK_NOT_FOUND,
+    BLOCK_DATA_CORRUPTED,
+};
+
+struct RpcResult {
+    RpcErrorCode error_code;
+    std::vector<uint8_t> data = std::vector<uint8_t>();
+};
+
+std::string ErrorMsg(RpcErrorCode code) {
+    switch (code) {
+        case RpcErrorCode::NO_ERROR:
+            return "No error";
+        case RpcErrorCode::INVALID_FLATBUFFER_ENCODING:
+            return "Invalid flatbuffer encoding";
+        case RpcErrorCode::UNKNOWN_RPC_METHOD:
+            return "Unknown RPC method";
+        case RpcErrorCode::BLOCK_ID_UNKNOWN_TYPE:
+            return "Unknown block ID type, only blockhash and block height "
+                   "allowed";
+        case RpcErrorCode::BLOCKHASH_INVALID_SIZE:
+            return "Invalid blockhash size, must be 32 bytes";
+        case RpcErrorCode::BLOCK_NOT_FOUND:
+            return "Block not found";
+        case RpcErrorCode::BLOCK_DATA_CORRUPTED:
+            return "Block data corrupted";
+        default:
+            return "Unknown error";
+    }
 }
 
-bool GetBlockIndex(const PluginInterface::GetBlockRequest *request,
-                   CBlockIndex *&block_index) {
+class PluginRpcServer;
+
+class PluginRpcWorker {
+    PluginRpcWorkerState m_state;
+    nng_aio *m_aio;
+    nng_ctx m_ctx;
+    PluginRpcServer *m_server;
+
+    void HandleCallback();
+
+public:
+    PluginRpcWorker();
+
+    void Init(nng_socket sock, PluginRpcServer *server);
+    static void Callback(void *arg);
+};
+
+class PluginRpcServer {
+    static const size_t NUM_WORKERS = 64;
+
+    nng_socket m_sock;
+    std::vector<PluginRpcWorker> m_workers;
+    bool m_is_running;
+    const Config &m_config;
+
+    RpcErrorCode GetBlock(flatbuffers::FlatBufferBuilder &builder,
+                          const PluginInterface::GetBlockRequest *request);
+    RpcErrorCode
+    GetBlockUndoData(flatbuffers::FlatBufferBuilder &builder,
+                     const PluginInterface::GetBlockUndoDataRequest *request);
+    RpcErrorCode GetMempool(flatbuffers::FlatBufferBuilder &builder,
+                            const PluginInterface::GetMempoolRequest *request);
+
+public:
+    PluginRpcServer(const Config &config);
+    RpcErrorCode HandleMsg(flatbuffers::FlatBufferBuilder &builder,
+                           nng_msg *incoming_msg);
+    void Serve(const std::string &rpc_url);
+    void Shutdown() { m_is_running = false; }
+};
+
+PluginRpcServer::PluginRpcServer(const Config &config) : m_config(config) {
+    m_is_running = false;
+}
+
+void PluginRpcServer::Serve(const std::string &rpc_url) {
+    NNG_TRY(nng_rep0_open(&m_sock));
+    std::cout << "NNG RPC server listening at " << rpc_url << std::endl;
+
+    m_workers.resize(NUM_WORKERS);
+
+    NNG_TRY(nng_listen(m_sock, rpc_url.c_str(), NULL, 0));
+
+    for (PluginRpcWorker &worker : m_workers) {
+        worker.Init(m_sock, this);
+    }
+
+    m_is_running = true;
+    while (m_is_running) {
+        nng_msleep(50);
+    }
+}
+
+PluginRpcWorker::PluginRpcWorker() {
+    m_state = PluginRpcWorkerState::UNINIT;
+}
+
+void PluginRpcWorker::Init(nng_socket sock, PluginRpcServer *server) {
+    m_server = server;
+    NNG_TRY(nng_aio_alloc(&m_aio, PluginRpcWorker::Callback, this));
+    NNG_TRY(nng_ctx_open(&m_ctx, sock));
+    m_state = PluginRpcWorkerState::RECV;
+    nng_ctx_recv(m_ctx, m_aio);
+}
+
+void PluginRpcWorker::Callback(void *arg) {
+    PluginRpcWorker *worker = (PluginRpcWorker *)arg;
+    worker->HandleCallback();
+}
+
+void PluginRpcWorker::HandleCallback() {
+    switch (m_state) {
+        case PluginRpcWorkerState::UNINIT:
+            std::cout << "Error: Worker in state UNINIT" << std::endl;
+            break;
+        case PluginRpcWorkerState::RECV: {
+            NNG_TRY(nng_aio_result(m_aio));
+            nng_msg *incoming_msg = nng_aio_get_msg(m_aio);
+            flatbuffers::FlatBufferBuilder builder;
+            RpcErrorCode error_code =
+                m_server->HandleMsg(builder, incoming_msg);
+            flatbuffers::FlatBufferBuilder result_builder(builder.GetSize() +
+                                                          256);
+            if (error_code == RpcErrorCode::NO_ERROR) {
+                result_builder.Finish(PluginInterface::CreateRpcResult(
+                    result_builder, true, 0, result_builder.CreateString(""),
+                    result_builder.CreateVector(builder.GetBufferPointer(),
+                                                builder.GetSize())));
+            } else {
+                result_builder.Finish(PluginInterface::CreateRpcResult(
+                    result_builder, false, int32_t(error_code),
+                    result_builder.CreateString(ErrorMsg(error_code))));
+            }
+            nng_msg *outgoing_msg;
+            NNG_TRY(nng_msg_alloc(&outgoing_msg, result_builder.GetSize()));
+            memcpy(nng_msg_body(outgoing_msg),
+                   (void *)result_builder.GetBufferPointer(),
+                   result_builder.GetSize());
+            nng_aio_set_msg(m_aio, outgoing_msg);
+            m_state = PluginRpcWorkerState::SEND;
+            nng_ctx_send(m_ctx, m_aio);
+            break;
+        }
+        case PluginRpcWorkerState::SEND: {
+            NNG_TRY(nng_aio_result(m_aio));
+            m_state = PluginRpcWorkerState::RECV;
+            nng_ctx_recv(m_ctx, m_aio);
+            break;
+        }
+    }
+}
+
+RpcErrorCode PluginRpcServer::HandleMsg(flatbuffers::FlatBufferBuilder &builder,
+                                        nng_msg *incoming_msg) {
+    flatbuffers::Verifier verifier((uint8_t *)nng_msg_body(incoming_msg),
+                                   nng_msg_len(incoming_msg));
+    if (!verifier.VerifyBuffer<PluginInterface::RpcCall>()) {
+        return RpcErrorCode::INVALID_FLATBUFFER_ENCODING;
+    }
+    const PluginInterface::RpcCall *rpc =
+        flatbuffers::GetRoot<PluginInterface::RpcCall>(
+            nng_msg_body(incoming_msg));
+    switch (rpc->rpc_type()) {
+        case PluginInterface::RpcCallType_GetBlockRequest: {
+            return GetBlock(builder, rpc->rpc_as_GetBlockRequest());
+        }
+        case PluginInterface::RpcCallType_GetBlockUndoDataRequest: {
+            return GetBlockUndoData(builder,
+                                    rpc->rpc_as_GetBlockUndoDataRequest());
+        }
+        case PluginInterface::RpcCallType_GetMempoolRequest: {
+            return GetMempool(builder, rpc->rpc_as_GetMempoolRequest());
+        }
+        default:
+            return RpcErrorCode::UNKNOWN_RPC_METHOD;
+    }
+}
+
+template <typename T>
+RpcErrorCode GetBlockIndex(const T *request, CBlockIndex *&block_index) {
     switch (request->block_id_type()) {
         case PluginInterface::BlockIdentifier_Height: {
             int32_t height = request->block_id_as_Height()->height();
@@ -47,396 +237,252 @@ bool GetBlockIndex(const PluginInterface::GetBlockRequest *request,
             break;
         }
         case PluginInterface::BlockIdentifier_Blockhash: {
-            const flatbuffers::Vector<uint8_t> *blockhash_fb = request->block_id_as_Blockhash()->blockhash();
-            const std::vector<uint8_t> blockhash(blockhash_fb->begin(), blockhash_fb->end());
-            
-            if (blockhash.size() != 32) {
-                return false; // "blockhash not 32 bytes long"
+            const flatbuffers::Vector<uint8_t> *blockhash_fb =
+                request->block_id_as_Blockhash()->blockhash();
+            const std::vector<uint8_t> blockhash(blockhash_fb->begin(),
+                                                 blockhash_fb->end());
+            if (blockhash.size() != uint256().size()) {
+                return RpcErrorCode::BLOCKHASH_INVALID_SIZE;
             }
             block_index = LookupBlockIndex(BlockHash(uint256(blockhash)));
             break;
         }
         default:
-            return false; // "Only height and blockhash supported"
+            return RpcErrorCode::BLOCK_ID_UNKNOWN_TYPE;
     }
     if (!block_index) {
-        return false; // "Block not found"
+        return RpcErrorCode::BLOCK_NOT_FOUND;
     }
-    return true;
+    return RpcErrorCode::NO_ERROR;
 }
 
-void server_cb(void *arg) {
-    work *work = (struct work *)arg;
-    nng_msg *msg;
-    int rv;
-
-    switch (work->state) {
-        case work::INIT:
-            work->state = work::RECV;
-            nng_ctx_recv(work->ctx, work->aio);
-            break;
-        case work::RECV: {
-            if ((rv = nng_aio_result(work->aio)) != 0) {
-                fatal("nng_ctx_recv", rv);
-            }
-            msg = nng_aio_get_msg(work->aio);
-            flatbuffers::Verifier verifier((uint8_t *)nng_msg_body(msg), nng_msg_len(msg));
-            if (!verifier.VerifyBuffer<PluginInterface::Rpc>()) {
-                std::cout << "Invalid message received" << std::endl;
-                return;
-            }
-            const PluginInterface::Rpc *rpc = flatbuffers::GetRoot<PluginInterface::Rpc>(nng_msg_body(msg));
-            switch (rpc->rpc_type()) {
-                case PluginInterface::RpcType_GetBlockRequest: {
-                    LOCK(cs_main);
-                    const PluginInterface::GetBlockRequest *request = rpc->rpc_as_GetBlockRequest();
-                    CBlockIndex *block_index;
-                    if (!GetBlockIndex(request, block_index)) {
-                        std::cout << "GetBlockIndex failed" << std::endl;
-                        return;
-                    }
-                    CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
-                    header << block_index->GetBlockHeader();
-                    flatbuffers::FlatBufferBuilder builder(1<<14);
-                    const Config &config = GetConfig();
-                    CBlock block;
-                    if (!ReadBlockFromDisk(block, block_index,
-                                           config.GetChainParams().GetConsensus())) {
-                        std::cout << "Read block data failed" << std::endl;
-                    }
-                    std::vector<flatbuffers::Offset<PluginInterface::Tx>> txs_fb;
-                    for (const CTransactionRef &tx : block.vtx) {
-                        CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
-                        tx_ser << tx;
-                        txs_fb.push_back(PluginInterface::CreateTx(builder, builder.CreateVector((uint8_t*)tx_ser.data(), tx_ser.size())));
-                    }
-                    auto block_fb = PluginInterface::CreateBlock(
-                        builder,
-                        builder.CreateVector((uint8_t*)header.data(), header.size()),
-                        builder.CreateVector<flatbuffers::Offset<PluginInterface::BlockMetadata>>({}),
-                        builder.CreateVector(txs_fb));
-                    auto response = PluginInterface::CreateGetBlockResponse(builder, block_fb);
-                    builder.Finish(response);
-                    flatbuffers::FlatBufferBuilder result_builder(builder.GetSize() + 1024);
-                    auto result = PluginInterface::CreateRpcResult(
-                        result_builder,
-                        true,
-                        result_builder.CreateString(""),
-                        result_builder.CreateVector(builder.GetBufferPointer(), builder.GetSize()));
-                    result_builder.Finish(result);
-                    nng_msg *msg_response;
-                    if ((rv = nng_msg_alloc(&msg_response, result_builder.GetSize())) != 0) {
-                        fatal("nng_msg_alloc", rv);
-                    }
-                    memcpy(nng_msg_body(msg_response), (void *)result_builder.GetBufferPointer(), result_builder.GetSize());
-                    nng_aio_set_msg(work->aio, msg_response);
-                    work->msg = NULL;
-                    work->state = work::SEND;
-                    nng_ctx_send(work->ctx, work->aio);
-                    return;
-                }
-                default:
-                    std::cout << "Got unimplemented message type" << std::endl;
-                    return;
-            }
-            // We could add more data to the message here.
-            //flatbuffers::FlatBufferBuilder builder(1024);
-            //PluginInterface::CreateBlock(builder, builder.CreateVector(std::vector<uint8_t>({1, 2, 3})));
-
-            /*if ((rv = nng_msg_alloc(&msg, 6)) != 0) {
-                fatal("nng_msg_alloc", rv);
-            }
-            const char *response = "Hello!";
-            memcpy(nng_msg_body(msg), (void *)response, 6);
-            nng_aio_set_msg(work->aio, msg);
-            work->msg = NULL;
-            work->state = work::SEND;
-            nng_ctx_send(work->ctx, work->aio);*/
-            break;
-        }
-        case work::SEND:
-            if ((rv = nng_aio_result(work->aio)) != 0) {
-                nng_msg_free(work->msg);
-                fatal("nng_ctx_send", rv);
-            }
-            work->state = work::RECV;
-            nng_ctx_recv(work->ctx, work->aio);
-            break;
-        default:
-            fatal("bad state!", NNG_ESTATE);
-            break;
+flatbuffers::Offset<PluginInterface::Block>
+CreateFbsBlock(flatbuffers::FlatBufferBuilder &builder, const CBlock &block) {
+    CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
+    header << block.GetBlockHeader();
+    std::vector<flatbuffers::Offset<PluginInterface::Tx>> txs_fbs;
+    for (const CTransactionRef &tx : block.vtx) {
+        CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
+        tx_ser << tx;
+        txs_fbs.push_back(PluginInterface::CreateTx(
+            builder,
+            builder.CreateVector((uint8_t *)tx_ser.data(), tx_ser.size())));
     }
+    return PluginInterface::CreateBlock(
+        builder, builder.CreateVector((uint8_t *)header.data(), header.size()),
+        builder
+            .CreateVector<flatbuffers::Offset<PluginInterface::BlockMetadata>>(
+                {}),
+        builder.CreateVector(txs_fbs));
 }
 
-void init_work(nng_socket sock, work &w) {
-    int rv;
-
-    if ((rv = nng_aio_alloc(&w.aio, server_cb, &w)) != 0) {
-        fatal("nng_aio_alloc", rv);
+RpcErrorCode
+PluginRpcServer::GetBlock(flatbuffers::FlatBufferBuilder &builder,
+                          const PluginInterface::GetBlockRequest *request) {
+    LOCK(cs_main);
+    RpcErrorCode code;
+    CBlockIndex *block_index;
+    if ((code = GetBlockIndex(request, block_index)) !=
+        RpcErrorCode::NO_ERROR) {
+        return code;
     }
-    if ((rv = nng_ctx_open(&w.ctx, sock)) != 0) {
-        fatal("nng_ctx_open", rv);
+    CBlock block;
+    if (!ReadBlockFromDisk(block, block_index,
+                           m_config.GetChainParams().GetConsensus())) {
+        return RpcErrorCode::BLOCK_DATA_CORRUPTED;
     }
-    w.state = work::INIT;
+    builder.Finish(PluginInterface::CreateGetBlockResponse(
+        builder, CreateFbsBlock(builder, block)));
+    return RpcErrorCode::NO_ERROR;
 }
 
-void server() {
-    const char *url = "tcp://127.0.0.1:5000";
-    nng_socket sock;
-    work works[PARALLEL];
-    int rv;
-    int i;
-
-    printf("Listening with NNG at %s\n", url);
-
-    /*  Create the socket. */
-    rv = nng_rep0_open(&sock);
-    if (rv != 0) {
-        fatal("nng_rep0_open", rv);
+RpcErrorCode PluginRpcServer::GetBlockUndoData(
+    flatbuffers::FlatBufferBuilder &builder,
+    const PluginInterface::GetBlockUndoDataRequest *request) {
+    LOCK(cs_main);
+    RpcErrorCode code;
+    CBlockIndex *block_index;
+    if ((code = GetBlockIndex(request, block_index)) !=
+        RpcErrorCode::NO_ERROR) {
+        return code;
     }
-
-    for (i = 0; i < PARALLEL; i++) {
-        init_work(sock, works[i]);
+    if (block_index->GetUndoPos().IsNull()) {
+        // return empty list of coins
+        builder.Finish(
+            PluginInterface::CreateGetBlockUndoDataResponse(builder));
+        return RpcErrorCode::NO_ERROR;
     }
-
-    if ((rv = nng_listen(sock, url, NULL, 0)) != 0) {
-        fatal("nng_listen", rv);
+    CBlockUndo blockundo;
+    if (!UndoReadFromDisk(blockundo, block_index)) {
+        return RpcErrorCode::BLOCK_DATA_CORRUPTED;
     }
-
-    for (i = 0; i < PARALLEL; i++) {
-        server_cb(&works[i]); // this starts them going (INIT state)
+    std::vector<flatbuffers::Offset<PluginInterface::Coin>> coins_fbs;
+    coins_fbs.reserve(blockundo.vtxundo.size());
+    for (const CTxUndo &txundo : blockundo.vtxundo) {
+        for (const Coin &coin : txundo.vprevout) {
+            coins_fbs.push_back(PluginInterface::CreateCoin(
+                builder, coin.GetTxOut().nValue / SATOSHI,
+                builder.CreateVector(coin.GetTxOut().scriptPubKey.data(),
+                                     coin.GetTxOut().scriptPubKey.size()),
+                coin.GetHeight(), coin.IsCoinBase()));
+        }
     }
-
-    for (;;) {
-        nng_msleep(3600000); // neither pause() nor sleep() portable
-    }
+    builder.Finish(PluginInterface::CreateGetBlockUndoDataResponse(
+        builder, builder.CreateVector(coins_fbs)));
+    return RpcErrorCode::NO_ERROR;
 }
 
-/*
-#include <grpcpp/ext/proto_server_reflection_plugin.h>
-#include <grpcpp/grpcpp.h>
-#include <grpcpp/health_check_service_interface.h>
+RpcErrorCode
+PluginRpcServer::GetMempool(flatbuffers::FlatBufferBuilder &builder,
+                            const PluginInterface::GetMempoolRequest *request) {
+    LOCK(g_mempool.cs);
+    std::vector<flatbuffers::Offset<PluginInterface::MempoolTx>> txs_fbs;
+    for (const CTxMemPoolEntry &entry : g_mempool.mapTx) {
+        CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
+        tx_ser << entry.GetTx();
+        txs_fbs.push_back(PluginInterface::CreateMempoolTx(
+            builder,
+            builder.CreateVector((uint8_t *)tx_ser.data(), tx_ser.size())));
+    }
+    builder.Finish(PluginInterface::CreateGetMempoolResponse(
+        builder, builder.CreateVector(txs_fbs)));
+    return RpcErrorCode::NO_ERROR;
+}
 
-#include "plugin_grpc.grpc.pb.h"
-#include "plugin_grpc.pb.h"
-
-#include <chain.h>
-#include <chainparams.h>
-#include <config.h>
-#include <streams.h>
-#include <sync.h>
-#include <txmempool.h>
-#include <undo.h>
-#include <validation.h>
-#include <validationinterface.h>
-
-// Logic and data behind the server's behavior.
-class NodeInterfaceServiceImpl final
-    : public plugin_grpc::NodeInterface::Service,
-      public CValidationInterface {
-    std::vector<grpc::ServerWriter<plugin_grpc::Message> *> messages_writers;
-    mutable RecursiveMutex cs;
-
-    grpc::Status
-    Messages(grpc::ServerContext *context,
-             const plugin_grpc::MessageSubscribeTo *request,
-             grpc::ServerWriter<plugin_grpc::Message> *reply) override {
-        LOCK(cs);
-        messages_writers.push_back(reply);
-        return grpc::Status::OK;
+class PluginPubServer final : public CValidationInterface {
+public:
+    void Listen(const std::string &rpc_url) {
+        NNG_TRY(nng_pub0_open(&m_sock));
+        NNG_TRY(nng_listen(m_sock, rpc_url.c_str(), NULL, 0));
+        std::cout << "NNG pub server listening at " << rpc_url << std::endl;
+        RegisterValidationInterface(this);
     }
 
-    grpc::Status GetBlockIndex(const plugin_grpc::BlockIdentifier &block_id,
-                               CBlockIndex *&block_index) {
-        switch (block_id.id_case()) {
-            case plugin_grpc::BlockIdentifier::IdCase::kHeight: {
-                int32_t height = block_id.height();
-                block_index = ::ChainActive().Tip()->GetAncestor(height);
-                break;
-            }
-            case plugin_grpc::BlockIdentifier::IdCase::kBlockhash: {
-                const std::string &blockhash_str = block_id.blockhash();
-                const std::vector<uint8_t> blockhash(blockhash_str.begin(),
-                                                     blockhash_str.end());
-                if (blockhash.size() != 32) {
-                    return {grpc::StatusCode::INVALID_ARGUMENT,
-                            "blockhash not 32 bytes long"};
-                }
-                block_index = LookupBlockIndex(BlockHash(uint256(blockhash)));
-                break;
-            }
-            default:
-                return {grpc::StatusCode::UNIMPLEMENTED,
-                        "Only height and blockhash supported"};
-        }
-        if (!block_index) {
-            return {grpc::StatusCode::NOT_FOUND, "Block not found"};
-        }
-        return grpc::Status::OK;
-    }
+private:
+    nng_socket m_sock;
 
-    grpc::Status GetBlock(grpc::ServerContext *context,
-                          const plugin_grpc::GetBlockRequest *request,
-                          plugin_grpc::GetBlockResponse *reply) override {
-        LOCK(cs_main);
-        CBlockIndex *block_index;
-        grpc::Status status = GetBlockIndex(request->block_id(), block_index);
-        if (!status.ok()) {
-            return status;
-        }
-        CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
-        header << block_index->GetBlockHeader();
-        plugin_grpc::Block *grpcBlock = reply->mutable_block();
-        grpcBlock->set_header(header.data(), header.size());
-        const Config &config = GetConfig();
-        CBlock block;
-        if (!ReadBlockFromDisk(block, block_index,
-                               config.GetChainParams().GetConsensus())) {
-            return {grpc::StatusCode::DATA_LOSS, "Read block data failed"};
-        }
-        for (CTransactionRef &tx : block.vtx) {
-            CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
-            tx_ser << tx;
-            grpcBlock->add_txs(tx_ser.data(), tx_ser.size());
-        }
-        return grpc::Status::OK;
-    }
-
-    grpc::Status
-    GetBlockUndoData(grpc::ServerContext *context,
-                     const plugin_grpc::GetBlockUndoDataRequest *request,
-                     plugin_grpc::GetBlockUndoDataResponse *reply) override {
-        LOCK(cs_main);
-        CBlockIndex *block_index;
-        grpc::Status status = GetBlockIndex(request->block_id(), block_index);
-        if (!status.ok()) {
-            return status;
-        }
-        if (block_index->GetUndoPos().IsNull()) {
-            // return empty list of coins
-            return grpc::Status::OK;
-        }
-        CBlockUndo blockundo;
-        if (!UndoReadFromDisk(blockundo, block_index)) {
-            return {grpc::StatusCode::DATA_LOSS, "Read block data failed"};
-        }
-        for (const CTxUndo &txundo : blockundo.vtxundo) {
-            for (const Coin &coin : txundo.vprevout) {
-                plugin_grpc::Coin *grpc_coin = reply->add_coins();
-                grpc_coin->set_amount(coin.GetTxOut().nValue / SATOSHI);
-                grpc_coin->set_script(coin.GetTxOut().scriptPubKey.data(),
-                                      coin.GetTxOut().scriptPubKey.size());
-                grpc_coin->set_height(coin.GetHeight());
-                grpc_coin->set_is_coinbase(coin.IsCoinBase());
-            }
-        }
-        return grpc::Status::OK;
-    }
-
-    grpc::Status GetMempool(grpc::ServerContext *context,
-                            const plugin_grpc::GetMempoolRequest *request,
-                            plugin_grpc::GetMempoolResponse *reply) override {
-        LOCK(g_mempool.cs);
-        for (const CTxMemPoolEntry &entry : g_mempool.mapTx) {
-            plugin_grpc::MempoolTx *grpc_tx = reply->add_txs();
-            CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
-            tx_ser << entry.GetTx();
-            grpc_tx->set_tx(tx_ser.data(), tx_ser.size());
-        }
-        return grpc::Status::OK;
-    }
-
-    void BroadcastMessage(const plugin_grpc::Message &message) {
-        LOCK(cs);
-        for (auto writer : messages_writers) {
-            if (!writer->Write(message)) {
-                std::cout << "Sending msg fail" << std::endl;
-            }
-        }
+    void BroadcastMessage(const std::string prefix,
+                          const flatbuffers::FlatBufferBuilder &fbb) {
+        std::vector<uint8_t> msg;
+        msg.resize(12 + fbb.GetSize());
+        memcpy(msg.data(), prefix.data(), prefix.size());
+        memcpy(msg.data() + 12, fbb.GetBufferPointer(), fbb.GetSize());
+        NNG_TRY(nng_send(m_sock, msg.data(), msg.size(), 0));
     }
 
     void UpdatedBlockTip(const CBlockIndex *pindexNew,
                          const CBlockIndex *pindexFork,
                          bool fInitialDownload) override {
-        plugin_grpc::Message msg;
-        msg.mutable_updated_block_tip()->set_blockhash(
-            pindexNew->GetBlockHash().begin(),
-            pindexNew->GetBlockHash().size());
-        BroadcastMessage(msg);
+        flatbuffers::FlatBufferBuilder fbb;
+        fbb.Finish(PluginInterface::CreateUpdatedBlockTip(
+            fbb, fbb.CreateVector(pindexNew->GetBlockHash().begin(),
+                                  pindexNew->GetBlockHash().size())));
+        BroadcastMessage("updateblktip", fbb);
     }
 
     void TransactionAddedToMempool(const CTransactionRef &ptx) override {
-        plugin_grpc::Message msg;
+        flatbuffers::FlatBufferBuilder fbb;
         CDataStream tx(SER_NETWORK, PROTOCOL_VERSION);
         tx << ptx;
-        msg.mutable_transaction_added_to_mempool()->set_tx(tx.data(),
-                                                           tx.size());
-        BroadcastMessage(msg);
+        fbb.Finish(PluginInterface::CreateTransactionAddedToMempool(
+            fbb, PluginInterface::CreateTx(
+                     fbb, fbb.CreateVector((uint8_t *)tx.data(), tx.size()))));
+        BroadcastMessage("mempooltxadd", fbb);
     }
 
     void TransactionRemovedFromMempool(const CTransactionRef &ptx) override {
-        plugin_grpc::Message msg;
-        msg.mutable_transaction_removed_from_mempool()->set_txid(
-            ptx->GetId().begin(), ptx->GetId().size());
-        BroadcastMessage(msg);
+        flatbuffers::FlatBufferBuilder fbb;
+        fbb.Finish(PluginInterface::CreateTransactionRemovedFromMempool(
+            fbb, fbb.CreateVector(ptx->GetId().begin(), ptx->GetId().size())));
+        BroadcastMessage("mempooltxrem", fbb);
     }
 
     void
     BlockConnected(const std::shared_ptr<const CBlock> &block,
                    const CBlockIndex *pindex,
                    const std::vector<CTransactionRef> &txnConflicted) override {
-        LOCK(cs);
+        flatbuffers::FlatBufferBuilder fbb;
+        auto block_fb = CreateFbsBlock(fbb, *block);
+        std::vector<PluginInterface::Txid> txs_conflicted;
+        for (const CTransactionRef &conflicted_tx : txnConflicted) {
+            PluginInterface::Txid txid;
+            memcpy(txid.mutable_id()->Data(), conflicted_tx->GetId().begin(),
+                   conflicted_tx->GetId().size());
+            txs_conflicted.push_back(txid);
+        }
+        fbb.Finish(PluginInterface::CreateBlockConnectedDirect(
+            fbb, block_fb, &txs_conflicted));
+        BroadcastMessage("blkconnected", fbb);
     }
 
     void
     BlockDisconnected(const std::shared_ptr<const CBlock> &block) override {
-        LOCK(cs);
+        flatbuffers::FlatBufferBuilder fbb;
+        fbb.Finish(PluginInterface::CreateBlockDisconnected(
+            fbb, fbb.CreateVector(block->GetHash().begin(),
+                                  block->GetHash().size())));
+        BroadcastMessage("blkdisconctd", fbb);
     }
-    void ChainStateFlushed(const CBlockLocator &locator) override { LOCK(cs); }
 
-    void ResendWalletTransactions(int64_t nBestBlockTime,
-                                  CConnman *connman) override {
-        LOCK(cs);
+    void ChainStateFlushed(const CBlockLocator &locator) override {
+        if (locator.vHave.size() == 0) {
+            return;
+        }
+        flatbuffers::FlatBufferBuilder fbb;
+        BlockHash blockhash = locator.vHave[0];
+        fbb.Finish(PluginInterface::CreateBlockDisconnected(
+            fbb, fbb.CreateVector(blockhash.begin(), blockhash.size())));
+        BroadcastMessage("chainstflush", fbb);
     }
-    void BlockChecked(const CBlock &, const CValidationState &) override {
-        LOCK(cs);
+
+    void BlockChecked(const CBlock &block,
+                      const CValidationState &validation_state) override {
+        flatbuffers::FlatBufferBuilder fbb;
+        PluginInterface::BlockValidationModeState state;
+        if (validation_state.IsValid()) {
+            state = PluginInterface::BlockValidationModeState_Valid;
+        } else if (validation_state.IsInvalid()) {
+            state = PluginInterface::BlockValidationModeState_Invalid;
+        } else {
+            state = PluginInterface::BlockValidationModeState_Error;
+        }
+        fbb.Finish(PluginInterface::CreateBlockChecked(
+            fbb,
+            fbb.CreateVector(block.GetHash().begin(), block.GetHash().size()),
+            PluginInterface::CreateBlockValidationState(
+                fbb, state,
+                fbb.CreateString(validation_state.GetRejectReason()),
+                fbb.CreateString(validation_state.GetDebugMessage()))));
+        BroadcastMessage("blockchecked", fbb);
     }
+
     void NewPoWValidBlock(const CBlockIndex *pindex,
                           const std::shared_ptr<const CBlock> &block) override {
-        LOCK(cs);
+        flatbuffers::FlatBufferBuilder fbb;
+        CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
+        header << block->GetBlockHeader();
+        fbb.Finish(PluginInterface::CreateUpdatedBlockTip(
+            fbb, fbb.CreateVector((uint8_t *)header.data(), header.size())));
+        BroadcastMessage("newpowvldblk", fbb);
     }
 };
 
-std::unique_ptr<grpc::Server> g_grpc_server;
+std::thread g_rpc_thread;
+std::unique_ptr<PluginRpcServer> g_rpc_server;
+std::unique_ptr<PluginPubServer> g_pub_server;
 
 void RunServer() {
-    std::string server_address("127.0.0.1:50051");
-    NodeInterfaceServiceImpl service;
-
-    grpc::EnableDefaultHealthCheckService(true);
-    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
-    grpc::ServerBuilder builder;
-    // Listen on the given address without any authentication mechanism.
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-    // Register "service" as the instance through which we'll communicate with
-    // clients. In this case it corresponds to an *synchronous* service.
-    builder.RegisterService(&service);
-    // Finally assemble the server.
-    g_grpc_server = std::unique_ptr(builder.BuildAndStart());
-    std::cout << "Server listening on " << server_address << std::endl;
-
-    // Wait for the server to shutdown. Note that some other thread must be
-    // responsible for shutting down the server for this call to ever return.
-    g_grpc_server->Wait();
-}*/
-
-std::thread g_grpc_thread;
+    g_rpc_server = std::make_unique<PluginRpcServer>(GetConfig());
+    g_rpc_server->Serve("tcp://127.0.0.1:5000");
+}
 
 void StartPluginNng() {
-    g_grpc_thread = std::thread(server);
+    g_rpc_thread = std::thread(RunServer);
+    g_pub_server = std::make_unique<PluginPubServer>();
+    g_pub_server->Listen("tcp://127.0.0.1:5001");
 }
 
 void StopPluginNng() {
-    // g_grpc_server->Shutdown();
-    // g_grpc_thread.join();
+    g_rpc_server->Shutdown();
+    g_rpc_thread.join();
 }
