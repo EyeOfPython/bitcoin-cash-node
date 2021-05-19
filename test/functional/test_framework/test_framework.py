@@ -597,6 +597,11 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         if not self.is_zmq_compiled():
             raise SkipTest("bitcoind has not been built with zmq enabled.")
 
+    def skip_if_no_bitcoind_plugin_interface(self):
+        """Skip the running test if bitcoind has not been compiled with plugin interface support."""
+        if not self.is_plugin_interface_compiled():
+            raise SkipTest("bitcoind has not been built with plugin interface support endabled.")
+
     def skip_if_no_wallet(self):
         """Skip the running test if wallet has not been compiled."""
         if not self.is_wallet_compiled():
@@ -627,3 +632,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         config.read_file(open(self.options.configfile, encoding='utf-8'))
 
         return config["components"].getboolean("ENABLE_ZMQ")
+
+    def is_plugin_interface_compiled(self):
+        """Checks whether the plugin inferface module was compiled."""
+        config = configparser.ConfigParser()
+        config.read_file(open(self.options.configfile, encoding='utf-8'))
+        return config["components"].getboolean("ENABLE_PLUGIN_NNG")

@@ -592,10 +592,8 @@ if(BUILD_BITCOIN_ZMQ)
 	target_link_libraries(server zmq)
 endif()
 
-if(BUILD_BITCOIN_PLUGIN_NNG)
-	add_subdirectory(plugin_nng)
-	target_link_libraries(server plugin_nng)
-endif()
+add_subdirectory(plugin_nng)
+target_link_libraries(server plugin_nng)
 
 # RPC client support
 add_library(rpcclient rpc/client.cpp)

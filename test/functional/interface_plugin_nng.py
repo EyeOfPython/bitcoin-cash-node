@@ -51,6 +51,7 @@ class PluginGRPCTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_py3_pynng()
         self.skip_if_no_py3_flatbuffers()
+        self.skip_if_no_bitcoind_plugin_interface()
 
     def run_test(self):
         try:
@@ -164,8 +165,12 @@ class PluginGRPCTest(BitcoinTestFramework):
         fbb.Finish(rpc)
         return bytes(fbb.Output())
 
-    def _check_response(self, response_msg, *, expect_error=None):
+    async def _send_request(self, rpc_sock, request, *, timeout=1):
+        await asyncio.wait_for(rpc_sock.asend(request), timeout=timeout)
+
+    async def _recv_response(self, rpc_sock, *, expect_error=None, timeout=1):
         from PluginInterface import RpcResult
+        response_msg = await asyncio.wait_for(rpc_sock.arecv_msg(), timeout=timeout)
         result = RpcResult.RpcResult.GetRootAsRpcResult(response_msg.bytes, 0)
         if expect_error is not None:
             assert not result.IsSuccess()
@@ -186,8 +191,8 @@ class PluginGRPCTest(BitcoinTestFramework):
         # Test for using both height and blockhash as reference
         for params in [{'height': 0}, {'blockhash': bytes.fromhex(rpc_genesis_blockhash)[::-1]}]:
             # Test GetBlock
-            await rpc_sock.asend(self._make_get_block_request_fbb(**params))
-            response = self._check_response(await rpc_sock.arecv_msg())
+            await self._send_request(rpc_sock, self._make_get_block_request_fbb(**params))
+            response = await self._recv_response(rpc_sock)
             response = GetBlockResponse.GetBlockResponse.GetRootAsGetBlockResponse(response, 0)
             block = response.Block()
             blockhash = hash256(get_fb_bytes(block, 'Header'))
@@ -197,32 +202,32 @@ class PluginGRPCTest(BitcoinTestFramework):
             assert_equal(get_fb_bytes(block.Txs(0), 'Raw').hex(), rpc_genesis_block['tx'][0]['hex'])
     
             # Test GetBlockUndoData
-            await rpc_sock.asend(self._make_get_block_undo_data_request_fbb(**params))
-            response = self._check_response(await rpc_sock.arecv_msg())
+            await self._send_request(rpc_sock, self._make_get_block_undo_data_request_fbb(**params))
+            response = await self._recv_response(rpc_sock)
             response = GetBlockUndoDataResponse.GetBlockUndoDataResponse.GetRootAsGetBlockUndoDataResponse(response, 0)
             assert_equal(response.CoinsLength(), 0)
 
     async def _tests_get_block_errors(self, rpc_sock):
         # Clean chain -> block 1 doesn't exist
-        await rpc_sock.asend(self._make_get_block_request_fbb(height=1))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Block not found')
+        await self._send_request(rpc_sock, self._make_get_block_request_fbb(height=1))
+        await self._recv_response(rpc_sock, expect_error='Block not found')
         # blockhash doesn't exist
-        await rpc_sock.asend(self._make_get_block_request_fbb(blockhash=bytes(32)))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Block not found')
+        await self._send_request(rpc_sock, self._make_get_block_request_fbb(blockhash=bytes(32)))
+        await self._recv_response(rpc_sock, expect_error='Block not found')
         # blockhash not 32 bytes
-        await rpc_sock.asend(self._make_get_block_request_fbb(blockhash=bytes(31)))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Invalid blockhash size, must be 32 bytes')
+        await self._send_request(rpc_sock, self._make_get_block_request_fbb(blockhash=bytes(31)))
+        await self._recv_response(rpc_sock, expect_error='Invalid blockhash size, must be 32 bytes')
 
     async def _tests_get_block_undo_data_errors(self, rpc_sock):
         # Clean chain -> block 1 doesn't exist
-        await rpc_sock.asend(self._make_get_block_undo_data_request_fbb(height=1))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Block not found')
+        await self._send_request(rpc_sock, self._make_get_block_undo_data_request_fbb(height=1))
+        await self._recv_response(rpc_sock, expect_error='Block not found')
         # blockhash doesn't exist
-        await rpc_sock.asend(self._make_get_block_undo_data_request_fbb(blockhash=bytes(32)))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Block not found')
+        await self._send_request(rpc_sock, self._make_get_block_undo_data_request_fbb(blockhash=bytes(32)))
+        await self._recv_response(rpc_sock, expect_error='Block not found')
         # blockhash not 32 bytes
-        await rpc_sock.asend(self._make_get_block_undo_data_request_fbb(blockhash=bytes(31)))
-        self._check_response(await rpc_sock.arecv_msg(), expect_error='Invalid blockhash size, must be 32 bytes')
+        await self._send_request(rpc_sock, self._make_get_block_undo_data_request_fbb(blockhash=bytes(31)))
+        await self._recv_response(rpc_sock, expect_error='Invalid blockhash size, must be 32 bytes')
 
     async def _tests_send_tx(self, node, rpc_sock):
         from PluginInterface import (
@@ -238,8 +243,8 @@ class PluginGRPCTest(BitcoinTestFramework):
         self.coin_blocks = hashes[1:]
         blockhash = bytes.fromhex(hashes[0])[::-1]
 
-        await rpc_sock.asend(self._make_get_block_request_fbb(blockhash=blockhash))
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_block_request_fbb(blockhash=blockhash))
+        response = await self._recv_response(rpc_sock)
         response = GetBlockResponse.GetBlockResponse.GetRootAsGetBlockResponse(response, 0)
         assert_equal(hash256(get_fb_bytes(response.Block(), 'Header'))[::-1].hex(), blockhash[::-1].hex())
         assert_equal(response.Block().MetadataLength(), 0)
@@ -261,16 +266,16 @@ class PluginGRPCTest(BitcoinTestFramework):
         pad_tx(tx)
 
         # Query mempool -> is empty
-        await rpc_sock.asend(self._make_get_mempool_request_fbs())
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_mempool_request_fbs())
+        response = await self._recv_response(rpc_sock)
         response = GetMempoolResponse.GetMempoolResponse.GetRootAsGetMempoolResponse(response, 0)
         assert_equal(response.TxsLength(), 0)
 
         # Broadcast tx
         node.sendrawtransaction(tx.serialize().hex())
         # Mempool now has tx
-        await rpc_sock.asend(self._make_get_mempool_request_fbs())
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_mempool_request_fbs())
+        response = await self._recv_response(rpc_sock)
         response = GetMempoolResponse.GetMempoolResponse.GetRootAsGetMempoolResponse(response, 0)
         assert_equal(response.TxsLength(), 1)
         assert_equal(get_fb_bytes(response.Txs(0), 'Tx').hex(), tx.serialize().hex())
@@ -278,15 +283,15 @@ class PluginGRPCTest(BitcoinTestFramework):
         # Mine tx
         hashes = node.generatetoaddress(1, address)
         # Mempool empty again
-        await rpc_sock.asend(self._make_get_mempool_request_fbs())
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_mempool_request_fbs())
+        response = await self._recv_response(rpc_sock)
         response = GetMempoolResponse.GetMempoolResponse.GetRootAsGetMempoolResponse(response, 0)
         assert_equal(response.TxsLength(), 0)
 
         # Block contains tx
         blockhash = bytes.fromhex(hashes[0])[::-1]
-        await rpc_sock.asend(self._make_get_block_request_fbb(blockhash=blockhash))
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_block_request_fbb(blockhash=blockhash))
+        response = await self._recv_response(rpc_sock)
         response = GetBlockResponse.GetBlockResponse.GetRootAsGetBlockResponse(response, 0)
         assert_equal(hash256(get_fb_bytes(response.Block(), 'Header'))[::-1].hex(), blockhash[::-1].hex())
         assert_equal(response.Block().MetadataLength(), 0)
@@ -294,8 +299,8 @@ class PluginGRPCTest(BitcoinTestFramework):
         assert_equal(get_fb_bytes(response.Block().Txs(1), 'Raw').hex(), tx.serialize().hex())
 
         # Undo data has coin data
-        await rpc_sock.asend(self._make_get_block_undo_data_request_fbb(blockhash=blockhash))
-        response = self._check_response(await rpc_sock.arecv_msg())
+        await self._send_request(rpc_sock, self._make_get_block_undo_data_request_fbb(blockhash=blockhash))
+        response = await self._recv_response(rpc_sock)
         response = GetBlockUndoDataResponse.GetBlockUndoDataResponse.GetRootAsGetBlockUndoDataResponse(response, 0)
         assert_equal(response.CoinsLength(), 1)
         assert_equal(response.Coins(0).Amount(), coinbase_value)
@@ -303,7 +308,8 @@ class PluginGRPCTest(BitcoinTestFramework):
         assert_equal(response.Coins(0).Height(), 1)
         assert_equal(response.Coins(0).IsCoinbase(), True)
 
-    def _check_message(self, received_msg, expected_msg_type):
+    async def _recv_message(self, pub_sock, expected_msg_type, timeout=2):
+        received_msg = await asyncio.wait_for(pub_sock.arecv_msg(), timeout=timeout)
         actual_msg_type = received_msg.bytes[:12]
         assert_equal(actual_msg_type.decode(), expected_msg_type)
         return received_msg.bytes[12:]
@@ -335,7 +341,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         pub_sock.subscribe('updateblktip')
         address = node.decodescript('51')['p2sh']
         hashes = node.generatetoaddress(1, address)
-        msg = self._check_message(await pub_sock.arecv_msg(), 'updateblktip')
+        msg = await self._recv_message(pub_sock, 'updateblktip')
         msg = UpdatedBlockTip.GetRootAsUpdatedBlockTip(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockhash')[::-1].hex(), hashes[0])
         pub_sock.unsubscribe('updateblktip')
@@ -350,7 +356,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         tx.vout.append(CTxOut(value - 1000, CScript([OP_HASH160, bytes(20), OP_EQUAL])))
         pad_tx(tx)
         node.sendrawtransaction(tx.serialize().hex())
-        msg = self._check_message(await pub_sock.arecv_msg(), 'mempooltxadd')
+        msg = await self._recv_message(pub_sock, 'mempooltxadd')
         msg = TransactionAddedToMempool.GetRootAsTransactionAddedToMempool(msg, 0)
         assert_equal(get_fb_bytes(msg.Tx(), 'Raw').hex(), tx.serialize().hex())
         pub_sock.unsubscribe('mempooltxadd')
@@ -370,7 +376,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         txhash = node.sendrawtransaction(tx.serialize().hex())
         entry_time = node.getmempoolentry(txhash)['time']
         node.setmocktime(entry_time + 3605)
-        msg = self._check_message(await pub_sock.arecv_msg(), 'mempooltxrem')
+        msg = await self._recv_message(pub_sock, 'mempooltxrem', timeout=5)
         msg = TransactionRemovedFromMempool.GetRootAsTransactionRemovedFromMempool(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Txid')[::-1].hex(), tx.hash)
         assert_equal(node.getrawmempool(), [])
@@ -395,7 +401,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         block.hashMerkleRoot = block.calc_merkle_root()
         block.solve()
         assert_equal(node.submitblock(block.serialize().hex()), None)
-        msg = self._check_message(await pub_sock.arecv_msg(), 'blkconnected')
+        msg = await self._recv_message(pub_sock, 'blkconnected')
         msg = BlockConnected.GetRootAsBlockConnected(msg, 0)
         assert_equal(get_fb_bytes(msg.Block(), 'Header').hex(), CBlockHeader(block).serialize().hex())
         assert_equal(msg.Block().MetadataLength(), 0)
@@ -417,7 +423,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         block2 = create_block(block1.hash, create_coinbase(tipblock['height'] + 2), tipblock['time'] + 2)
         block2.solve()
         assert_equal(node.submitblock(block2.serialize().hex()), None)
-        msg = self._check_message(await pub_sock.arecv_msg(), 'blkdisconctd')
+        msg = await self._recv_message(pub_sock, 'blkdisconctd')
         msg = BlockDisconnected.GetRootAsBlockDisconnected(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockhash')[::-1].hex(), reorged_blockhash)
         pub_sock.unsubscribe('blkdisconctd')
@@ -427,7 +433,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         pub_sock.subscribe('chainstflush')
         tip = node.getbestblockhash()
         node.gettxoutsetinfo() # forces chain flush
-        msg = self._check_message(await pub_sock.arecv_msg(), 'chainstflush')
+        msg = await self._recv_message(pub_sock, 'chainstflush')
         msg = ChainStateFlushed.GetRootAsChainStateFlushed(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockhash')[::-1].hex(), tip)
         pub_sock.unsubscribe('chainstflush')
@@ -438,7 +444,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         pub_sock.subscribe('blockchecked')
         # Send valid block
         generated_blockhash = node.generate(1)[0]
-        msg = self._check_message(await pub_sock.arecv_msg(), 'blockchecked')
+        msg = await self._recv_message(pub_sock, 'blockchecked')
         msg = BlockChecked.GetRootAsBlockChecked(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockhash')[::-1].hex(), generated_blockhash)
         assert_equal(msg.ValidationState().State(), BlockValidationModeState.Valid)
@@ -449,7 +455,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         block.vtx.append(CTransaction())  # invalidate merkle root
         block.solve()
         assert_equal(node.submitblock(block.serialize().hex()), 'bad-txnmrklroot')
-        msg = self._check_message(await pub_sock.arecv_msg(), 'blockchecked')
+        msg = await self._recv_message(pub_sock, 'blockchecked')
         msg = BlockChecked.GetRootAsBlockChecked(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockhash')[::-1].hex(), block.hash)
         assert_equal(msg.ValidationState().State(), BlockValidationModeState.Invalid)
@@ -463,7 +469,7 @@ class PluginGRPCTest(BitcoinTestFramework):
         block = self._create_block(node)
         block.solve()
         assert_equal(node.submitblock(block.serialize().hex()), None)
-        msg = self._check_message(await pub_sock.arecv_msg(), 'newpowvldblk')
+        msg = await self._recv_message(pub_sock, 'newpowvldblk')
         msg = NewPoWValidBlock.GetRootAsNewPoWValidBlock(msg, 0)
         assert_equal(get_fb_bytes(msg, 'Blockheader').hex(), CBlockHeader(block).serialize().hex())
         pub_sock.unsubscribe('newpowvldblk')

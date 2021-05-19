@@ -1,0 +1,2 @@
+void StartPluginNng() {}
+void StopPluginNng() {}
