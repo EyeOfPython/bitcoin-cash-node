@@ -1,9 +1,3 @@
-#include <iostream>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include <nng/nng.h>
 #include <nng/protocol/pubsub0/pub.h>
 #include <nng/protocol/reqrep0/rep.h>
@@ -15,6 +9,9 @@
 #include <chainparams.h>
 #include <config.h>
 #include <consensus/validation.h>
+#include <logging.h>
+#include <node/transaction.h>
+#include <rpc/protocol.h>
 #include <streams.h>
 #include <sync.h>
 #include <txmempool.h>
@@ -22,7 +19,6 @@
 #include <util/system.h>
 #include <validation.h>
 #include <validationinterface.h>
-#include <logging.h>
 
 #include "plugin_interface_generated.h"
 
@@ -34,15 +30,18 @@ enum class PluginRpcWorkerState {
 
 class PluginRpcServer;
 
-#define NNG_TRY(call)                                                          \
+#define NNG_TRY_FN(call, abort_fn)                                             \
     do {                                                                       \
         int rv = (call);                                                       \
         if (rv != 0) {                                                         \
-            fprintf(stderr, "NNG Error: %s\n  at %s:%d: %s\n",                 \
-                    nng_strerror(rv), __FILE__, __LINE__, #call);              \
-            exit(1);                                                           \
+            LogPrintf("NNG Error: %s (at %s:%d: %s)\n", nng_strerror(rv),      \
+                      __FILE__, __LINE__, #call);                              \
+            abort_fn;                                                          \
         }                                                                      \
     } while (false)
+
+#define NNG_TRY(call) NNG_TRY_FN(call, return )
+#define NNG_TRY_ABORT(call) NNG_TRY_FN(call, exit(0))
 
 enum RpcErrorCode {
     NO_ERROR = 0,
@@ -114,6 +113,14 @@ class PluginRpcServer {
                      const PluginInterface::GetBlockUndoDataRequest *request);
     RpcErrorCode GetMempool(flatbuffers::FlatBufferBuilder &builder,
                             const PluginInterface::GetMempoolRequest *request);
+    RpcErrorCode
+    GetBlockchainInfo(flatbuffers::FlatBufferBuilder &builder,
+                      const PluginInterface::GetBlockchainInfoRequest *request);
+    RpcErrorCode
+    SubmitBlock(flatbuffers::FlatBufferBuilder &builder,
+                const PluginInterface::SubmitBlockRequest *request);
+    RpcErrorCode SubmitTx(flatbuffers::FlatBufferBuilder &builder,
+                          const PluginInterface::SubmitTxRequest *request);
 
 public:
     PluginRpcServer(const Config &config);
@@ -128,12 +135,12 @@ PluginRpcServer::PluginRpcServer(const Config &config) : m_config(config) {
 }
 
 void PluginRpcServer::Serve(const std::string &rpc_url) {
-    NNG_TRY(nng_rep0_open(&m_sock));
-    std::cout << "NNG RPC server listening at " << rpc_url << std::endl;
+    NNG_TRY_ABORT(nng_rep0_open(&m_sock));
+    LogPrintf("Plugin interface: NNG RPC server listening at %s\n", rpc_url);
 
     m_workers.resize(NUM_WORKERS);
 
-    NNG_TRY(nng_listen(m_sock, rpc_url.c_str(), NULL, 0));
+    NNG_TRY_ABORT(nng_listen(m_sock, rpc_url.c_str(), NULL, 0));
 
     for (PluginRpcWorker &worker : m_workers) {
         worker.Init(m_sock, this);
@@ -151,8 +158,8 @@ PluginRpcWorker::PluginRpcWorker() {
 
 void PluginRpcWorker::Init(nng_socket sock, PluginRpcServer *server) {
     m_server = server;
-    NNG_TRY(nng_aio_alloc(&m_aio, PluginRpcWorker::Callback, this));
-    NNG_TRY(nng_ctx_open(&m_ctx, sock));
+    NNG_TRY_ABORT(nng_aio_alloc(&m_aio, PluginRpcWorker::Callback, this));
+    NNG_TRY_ABORT(nng_ctx_open(&m_ctx, sock));
     m_state = PluginRpcWorkerState::RECV;
     nng_ctx_recv(m_ctx, m_aio);
 }
@@ -165,31 +172,28 @@ void PluginRpcWorker::Callback(void *arg) {
 void PluginRpcWorker::HandleCallback() {
     switch (m_state) {
         case PluginRpcWorkerState::UNINIT:
-            std::cout << "Error: Worker in state UNINIT" << std::endl;
+            LogPrintf("Error: Worker in state UNINIT\n");
             break;
         case PluginRpcWorkerState::RECV: {
             NNG_TRY(nng_aio_result(m_aio));
             nng_msg *incoming_msg = nng_aio_get_msg(m_aio);
-            flatbuffers::FlatBufferBuilder builder;
-            RpcErrorCode error_code =
-                m_server->HandleMsg(builder, incoming_msg);
-            flatbuffers::FlatBufferBuilder result_builder(builder.GetSize() +
-                                                          256);
+            flatbuffers::FlatBufferBuilder fbb;
+            RpcErrorCode error_code = m_server->HandleMsg(fbb, incoming_msg);
+            flatbuffers::FlatBufferBuilder result_fbb(fbb.GetSize() + 256);
             if (error_code == RpcErrorCode::NO_ERROR) {
-                result_builder.Finish(PluginInterface::CreateRpcResult(
-                    result_builder, true, 0, result_builder.CreateString(""),
-                    result_builder.CreateVector(builder.GetBufferPointer(),
-                                                builder.GetSize())));
+                result_fbb.Finish(PluginInterface::CreateRpcResult(
+                    result_fbb, true, 0, result_fbb.CreateString(""),
+                    result_fbb.CreateVector(fbb.GetBufferPointer(),
+                                            fbb.GetSize())));
             } else {
-                result_builder.Finish(PluginInterface::CreateRpcResult(
-                    result_builder, false, int32_t(error_code),
-                    result_builder.CreateString(ErrorMsg(error_code))));
+                result_fbb.Finish(PluginInterface::CreateRpcResult(
+                    result_fbb, false, int32_t(error_code),
+                    result_fbb.CreateString(ErrorMsg(error_code))));
             }
             nng_msg *outgoing_msg;
-            NNG_TRY(nng_msg_alloc(&outgoing_msg, result_builder.GetSize()));
+            NNG_TRY(nng_msg_alloc(&outgoing_msg, result_fbb.GetSize()));
             memcpy(nng_msg_body(outgoing_msg),
-                   (void *)result_builder.GetBufferPointer(),
-                   result_builder.GetSize());
+                   (void *)result_fbb.GetBufferPointer(), result_fbb.GetSize());
             nng_aio_set_msg(m_aio, outgoing_msg);
             m_state = PluginRpcWorkerState::SEND;
             nng_ctx_send(m_ctx, m_aio);
@@ -204,7 +208,7 @@ void PluginRpcWorker::HandleCallback() {
     }
 }
 
-RpcErrorCode PluginRpcServer::HandleMsg(flatbuffers::FlatBufferBuilder &builder,
+RpcErrorCode PluginRpcServer::HandleMsg(flatbuffers::FlatBufferBuilder &fbb,
                                         nng_msg *incoming_msg) {
     flatbuffers::Verifier verifier((uint8_t *)nng_msg_body(incoming_msg),
                                    nng_msg_len(incoming_msg));
@@ -216,14 +220,23 @@ RpcErrorCode PluginRpcServer::HandleMsg(flatbuffers::FlatBufferBuilder &builder,
             nng_msg_body(incoming_msg));
     switch (rpc->rpc_type()) {
         case PluginInterface::RpcCallType_GetBlockRequest: {
-            return GetBlock(builder, rpc->rpc_as_GetBlockRequest());
+            return GetBlock(fbb, rpc->rpc_as_GetBlockRequest());
         }
         case PluginInterface::RpcCallType_GetBlockUndoDataRequest: {
-            return GetBlockUndoData(builder,
-                                    rpc->rpc_as_GetBlockUndoDataRequest());
+            return GetBlockUndoData(fbb, rpc->rpc_as_GetBlockUndoDataRequest());
         }
         case PluginInterface::RpcCallType_GetMempoolRequest: {
-            return GetMempool(builder, rpc->rpc_as_GetMempoolRequest());
+            return GetMempool(fbb, rpc->rpc_as_GetMempoolRequest());
+        }
+        case PluginInterface::RpcCallType_GetBlockchainInfoRequest: {
+            return GetBlockchainInfo(fbb,
+                                     rpc->rpc_as_GetBlockchainInfoRequest());
+        }
+        case PluginInterface::RpcCallType_SubmitBlockRequest: {
+            return SubmitBlock(fbb, rpc->rpc_as_SubmitBlockRequest());
+        }
+        case PluginInterface::RpcCallType_SubmitTxRequest: {
+            return SubmitTx(fbb, rpc->rpc_as_SubmitTxRequest());
         }
         default:
             return RpcErrorCode::UNKNOWN_RPC_METHOD;
@@ -238,9 +251,9 @@ RpcErrorCode GetBlockIndex(const T *request, CBlockIndex *&block_index) {
             block_index = ::ChainActive().Tip()->GetAncestor(height);
             break;
         }
-        case PluginInterface::BlockIdentifier_Blockhash: {
+        case PluginInterface::BlockIdentifier_Hash: {
             const flatbuffers::Vector<uint8_t> *blockhash_fb =
-                request->block_id_as_Blockhash()->blockhash();
+                request->block_id_as_Hash()->hash();
             const std::vector<uint8_t> blockhash(blockhash_fb->begin(),
                                                  blockhash_fb->end());
             if (blockhash.size() != uint256().size()) {
@@ -258,28 +271,63 @@ RpcErrorCode GetBlockIndex(const T *request, CBlockIndex *&block_index) {
     return RpcErrorCode::NO_ERROR;
 }
 
+flatbuffers::Offset<PluginInterface::BlockHash>
+CreateFbsBlockHash(flatbuffers::FlatBufferBuilder &fbb, const BlockHash &hash) {
+    return PluginInterface::CreateBlockHash(
+        fbb, fbb.CreateVector(hash.begin(), hash.size()));
+}
+
+flatbuffers::Offset<PluginInterface::BlockHeader>
+CreateFbsBlockHeader(flatbuffers::FlatBufferBuilder &fbb,
+                     const CBlockHeader &header) {
+    CDataStream raw_header(SER_NETWORK, PROTOCOL_VERSION);
+    raw_header << header;
+    return PluginInterface::CreateBlockHeader(
+        fbb, fbb.CreateVector((uint8_t *)raw_header.data(), raw_header.size()),
+        CreateFbsBlockHash(fbb, header.GetHash()),
+        CreateFbsBlockHash(fbb, header.hashPrevBlock), header.nBits,
+        header.nTime);
+}
+
+flatbuffers::Offset<PluginInterface::TxId>
+CreateFbsTxId(flatbuffers::FlatBufferBuilder &fbb, const TxId &txid) {
+    return PluginInterface::CreateTxId(
+        fbb, fbb.CreateVector(txid.begin(), txid.size()));
+}
+
+flatbuffers::Offset<PluginInterface::Tx>
+CreateFbsTx(flatbuffers::FlatBufferBuilder &fbb, const CTransactionRef &tx) {
+    CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
+    tx_ser << tx;
+    return PluginInterface::CreateTx(
+        fbb, CreateFbsTxId(fbb, tx->GetId()),
+        fbb.CreateVector((uint8_t *)tx_ser.data(), tx_ser.size()));
+}
+
+flatbuffers::Offset<PluginInterface::Coin>
+CreateFbsCoin(flatbuffers::FlatBufferBuilder &fbb, const Coin &coin) {
+    return PluginInterface::CreateCoin(
+        fbb, coin.GetTxOut().nValue / SATOSHI,
+        fbb.CreateVector(coin.GetTxOut().scriptPubKey.data(),
+                         coin.GetTxOut().scriptPubKey.size()),
+        coin.GetHeight(), coin.IsCoinBase());
+}
+
 flatbuffers::Offset<PluginInterface::Block>
-CreateFbsBlock(flatbuffers::FlatBufferBuilder &builder, const CBlock &block) {
-    CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
-    header << block.GetBlockHeader();
+CreateFbsBlock(flatbuffers::FlatBufferBuilder &fbb, const CBlock &block) {
     std::vector<flatbuffers::Offset<PluginInterface::Tx>> txs_fbs;
     for (const CTransactionRef &tx : block.vtx) {
-        CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
-        tx_ser << tx;
-        txs_fbs.push_back(PluginInterface::CreateTx(
-            builder,
-            builder.CreateVector((uint8_t *)tx_ser.data(), tx_ser.size())));
+        txs_fbs.push_back(CreateFbsTx(fbb, tx));
     }
     return PluginInterface::CreateBlock(
-        builder, builder.CreateVector((uint8_t *)header.data(), header.size()),
-        builder
-            .CreateVector<flatbuffers::Offset<PluginInterface::BlockMetadata>>(
-                {}),
-        builder.CreateVector(txs_fbs));
+        fbb, CreateFbsBlockHeader(fbb, block.GetBlockHeader()),
+        fbb.CreateVector<flatbuffers::Offset<PluginInterface::BlockMetadata>>(
+            {}),
+        fbb.CreateVector(txs_fbs));
 }
 
 RpcErrorCode
-PluginRpcServer::GetBlock(flatbuffers::FlatBufferBuilder &builder,
+PluginRpcServer::GetBlock(flatbuffers::FlatBufferBuilder &fbb,
                           const PluginInterface::GetBlockRequest *request) {
     LOCK(cs_main);
     RpcErrorCode code;
@@ -293,13 +341,13 @@ PluginRpcServer::GetBlock(flatbuffers::FlatBufferBuilder &builder,
                            m_config.GetChainParams().GetConsensus())) {
         return RpcErrorCode::BLOCK_DATA_CORRUPTED;
     }
-    builder.Finish(PluginInterface::CreateGetBlockResponse(
-        builder, CreateFbsBlock(builder, block)));
+    fbb.Finish(PluginInterface::CreateGetBlockResponse(
+        fbb, CreateFbsBlock(fbb, block)));
     return RpcErrorCode::NO_ERROR;
 }
 
 RpcErrorCode PluginRpcServer::GetBlockUndoData(
-    flatbuffers::FlatBufferBuilder &builder,
+    flatbuffers::FlatBufferBuilder &fbb,
     const PluginInterface::GetBlockUndoDataRequest *request) {
     LOCK(cs_main);
     RpcErrorCode code;
@@ -310,53 +358,214 @@ RpcErrorCode PluginRpcServer::GetBlockUndoData(
     }
     if (block_index->GetUndoPos().IsNull()) {
         // return empty list of coins
-        builder.Finish(
-            PluginInterface::CreateGetBlockUndoDataResponse(builder));
+        fbb.Finish(PluginInterface::CreateGetBlockUndoDataResponse(fbb));
         return RpcErrorCode::NO_ERROR;
     }
     CBlockUndo blockundo;
     if (!UndoReadFromDisk(blockundo, block_index)) {
         return RpcErrorCode::BLOCK_DATA_CORRUPTED;
     }
-    std::vector<flatbuffers::Offset<PluginInterface::Coin>> coins_fbs;
-    coins_fbs.reserve(blockundo.vtxundo.size());
+    std::vector<flatbuffers::Offset<PluginInterface::TxUndo>> txundo_fbs;
+    std::vector<std::vector<flatbuffers::Offset<PluginInterface::Coin>>>
+        txcoins_fbs;
+    txundo_fbs.reserve(blockundo.vtxundo.size());
+    txcoins_fbs.reserve(blockundo.vtxundo.size());
     for (const CTxUndo &txundo : blockundo.vtxundo) {
+        std::vector<flatbuffers::Offset<PluginInterface::Coin>> coins_fbs;
+        coins_fbs.reserve(txundo.vprevout.size());
         for (const Coin &coin : txundo.vprevout) {
-            coins_fbs.push_back(PluginInterface::CreateCoin(
-                builder, coin.GetTxOut().nValue / SATOSHI,
-                builder.CreateVector(coin.GetTxOut().scriptPubKey.data(),
-                                     coin.GetTxOut().scriptPubKey.size()),
-                coin.GetHeight(), coin.IsCoinBase()));
+            coins_fbs.push_back(CreateFbsCoin(fbb, coin));
         }
+        txcoins_fbs.push_back(std::move(coins_fbs));
     }
-    builder.Finish(PluginInterface::CreateGetBlockUndoDataResponse(
-        builder, builder.CreateVector(coins_fbs)));
+    for (const auto &coin_fbs : txcoins_fbs) {
+        txundo_fbs.push_back(
+            PluginInterface::CreateTxUndo(fbb, fbb.CreateVector(coin_fbs)));
+    }
+    fbb.Finish(PluginInterface::CreateGetBlockUndoDataResponse(
+        fbb, fbb.CreateVector(txundo_fbs)));
     return RpcErrorCode::NO_ERROR;
 }
 
 RpcErrorCode
-PluginRpcServer::GetMempool(flatbuffers::FlatBufferBuilder &builder,
+PluginRpcServer::GetMempool(flatbuffers::FlatBufferBuilder &fbb,
                             const PluginInterface::GetMempoolRequest *request) {
     LOCK(g_mempool.cs);
     std::vector<flatbuffers::Offset<PluginInterface::MempoolTx>> txs_fbs;
     for (const CTxMemPoolEntry &entry : g_mempool.mapTx) {
-        CDataStream tx_ser(SER_NETWORK, PROTOCOL_VERSION);
-        tx_ser << entry.GetTx();
         txs_fbs.push_back(PluginInterface::CreateMempoolTx(
-            builder,
-            builder.CreateVector((uint8_t *)tx_ser.data(), tx_ser.size())));
+            fbb, CreateFbsTx(fbb, entry.GetSharedTx())));
     }
-    builder.Finish(PluginInterface::CreateGetMempoolResponse(
-        builder, builder.CreateVector(txs_fbs)));
+    fbb.Finish(PluginInterface::CreateGetMempoolResponse(
+        fbb, fbb.CreateVector(txs_fbs)));
+    return RpcErrorCode::NO_ERROR;
+}
+
+RpcErrorCode PluginRpcServer::GetBlockchainInfo(
+    flatbuffers::FlatBufferBuilder &fbb,
+    const PluginInterface::GetBlockchainInfoRequest *request) {
+    const CBlockIndex *tip = ::ChainActive().Tip();
+
+    fbb.Finish(PluginInterface::CreateGetBlockchainInfoResponse(
+        fbb, fbb.CreateString(m_config.GetChainParams().NetworkIDString()),
+        ::ChainActive().Height(), CreateFbsBlockHash(fbb, tip->GetBlockHash()),
+        fPruneMode, IsInitialBlockDownload(),
+        GuessVerificationProgress(Params().TxData(), tip)));
+    return RpcErrorCode::NO_ERROR;
+}
+
+class SubmitBlock_StateCatcher : public CValidationInterface {
+public:
+    uint256 hash;
+    bool found;
+    CValidationState state;
+
+    explicit SubmitBlock_StateCatcher(const uint256 &hashIn)
+        : hash(hashIn), found(false), state() {}
+
+protected:
+    void BlockChecked(const CBlock &block,
+                      const CValidationState &stateIn) override {
+        if (block.GetHash() != hash) {
+            return;
+        }
+
+        found = true;
+        state = stateIn;
+    }
+};
+
+RpcErrorCode PluginRpcServer::SubmitBlock(
+    flatbuffers::FlatBufferBuilder &fbb,
+    const PluginInterface::SubmitBlockRequest *request) {
+    std::shared_ptr<CBlock> blockptr = std::make_shared<CBlock>();
+    CBlock &block = *blockptr;
+    std::vector<uint8_t> blockData(request->raw_block()->begin(),
+                                   request->raw_block()->end());
+    CDataStream ssBlock(blockData, SER_NETWORK, PROTOCOL_VERSION);
+    try {
+        ssBlock >> block;
+    } catch (const std::exception &) {
+        fbb.Finish(PluginInterface::CreateSubmitBlockResponse(
+            fbb, false, fbb.CreateString("invalid"),
+            fbb.CreateString("Block decode failed")));
+        return RpcErrorCode::NO_ERROR;
+    }
+
+    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
+        fbb.Finish(PluginInterface::CreateSubmitBlockResponse(
+            fbb, false, fbb.CreateString("invalid"),
+            fbb.CreateString("Block does not start with a coinbase")));
+        return RpcErrorCode::NO_ERROR;
+    }
+
+    const BlockHash hash = block.GetHash();
+    {
+        LOCK(cs_main);
+        const CBlockIndex *pindex = LookupBlockIndex(hash);
+        std::string state = "";
+        if (pindex) {
+            if (pindex->IsValid(BlockValidity::SCRIPTS)) {
+                state = "duplicate";
+            }
+            if (pindex->nStatus.isInvalid()) {
+                state = "duplicate-invalid";
+            }
+        }
+        if (!state.empty()) {
+            fbb.Finish(PluginInterface::CreateSubmitBlockResponse(
+                fbb, false, fbb.CreateString(state),
+                fbb.CreateString("Block already exists")));
+            return RpcErrorCode::NO_ERROR;
+        }
+    }
+
+    bool new_block;
+    SubmitBlock_StateCatcher state_catcher(block.GetHash());
+    RegisterValidationInterface(&state_catcher);
+    bool accepted = ProcessNewBlock(m_config, blockptr,
+                                    /* fForceProcessing */ true,
+                                    /* fNewBlock */ &new_block);
+    UnregisterValidationInterface(&state_catcher);
+    std::string state = "";
+    std::string msg = "";
+    bool is_accepted = false;
+    if (!new_block && accepted) {
+        state = "duplicate";
+    }
+
+    if (state.empty() && !state_catcher.found) {
+        is_accepted = true;
+        state = "inconclusive";
+    }
+
+    if (state.empty()) {
+        if (state_catcher.state.IsValid()) {
+            is_accepted = true;
+            state = "valid";
+        } else if (state_catcher.state.IsError()) {
+            is_accepted = false;
+            state = "error";
+            msg = FormatStateMessage(state_catcher.state);
+        } else if (state_catcher.state.IsInvalid()) {
+            is_accepted = false;
+            state = "invalid";
+            msg = state_catcher.state.GetRejectReason();
+            if (msg.empty()) {
+                msg = "rejected";
+            }
+        } else {
+            is_accepted = false;
+            state = "unreachable";
+        }
+    }
+    fbb.Finish(PluginInterface::CreateSubmitBlockResponse(
+        fbb, is_accepted, fbb.CreateString(state), fbb.CreateString(msg)));
+    return RpcErrorCode::NO_ERROR;
+}
+
+RpcErrorCode
+PluginRpcServer::SubmitTx(flatbuffers::FlatBufferBuilder &fbb,
+                          const PluginInterface::SubmitTxRequest *request) {
+    std::vector<uint8_t> txdata(request->raw_tx()->begin(),
+                                request->raw_tx()->end());
+    CDataStream ss(txdata, SER_NETWORK, PROTOCOL_VERSION);
+    CMutableTransaction mtx;
+    bool parse_fail = true;
+    try {
+        ss >> mtx;
+        if (ss.eof()) {
+            parse_fail = false;
+        }
+    } catch (const std::exception &e) {
+        // Fall through.
+    }
+    if (parse_fail) {
+        fbb.Finish(PluginInterface::CreateSubmitTxResponse(
+            fbb, false, fbb.CreateString("tx-decode-fail")));
+        return RpcErrorCode::NO_ERROR;
+    }
+    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
+    TxId txid;
+    try {
+        txid = BroadcastTransaction(m_config, tx, request->allow_high_fees());
+    } catch (JSONRPCError e) {
+        fbb.Finish(PluginInterface::CreateSubmitTxResponse(
+            fbb, false, fbb.CreateString(e.message)));
+        return RpcErrorCode::NO_ERROR;
+    }
+    fbb.Finish(PluginInterface::CreateSubmitTxResponse(
+        fbb, true, fbb.CreateString(""), CreateFbsTxId(fbb, txid)));
     return RpcErrorCode::NO_ERROR;
 }
 
 class PluginPubServer final : public CValidationInterface {
 public:
-    void Listen(const std::string &rpc_url) {
-        NNG_TRY(nng_pub0_open(&m_sock));
-        NNG_TRY(nng_listen(m_sock, rpc_url.c_str(), NULL, 0));
-        std::cout << "NNG pub server listening at " << rpc_url << std::endl;
+    void Listen(const std::string &pub_url) {
+        NNG_TRY_ABORT(nng_pub0_open(&m_sock));
+        NNG_TRY_ABORT(nng_listen(m_sock, pub_url.c_str(), NULL, 0));
+        LogPrintf("Plugin interface: NNG pub server listening at %s\n",
+                  pub_url);
         RegisterValidationInterface(this);
     }
 
@@ -377,25 +586,21 @@ private:
                          bool fInitialDownload) override {
         flatbuffers::FlatBufferBuilder fbb;
         fbb.Finish(PluginInterface::CreateUpdatedBlockTip(
-            fbb, fbb.CreateVector(pindexNew->GetBlockHash().begin(),
-                                  pindexNew->GetBlockHash().size())));
+            fbb, CreateFbsBlockHash(fbb, pindexNew->GetBlockHash())));
         BroadcastMessage("updateblktip", fbb);
     }
 
     void TransactionAddedToMempool(const CTransactionRef &ptx) override {
         flatbuffers::FlatBufferBuilder fbb;
-        CDataStream tx(SER_NETWORK, PROTOCOL_VERSION);
-        tx << ptx;
         fbb.Finish(PluginInterface::CreateTransactionAddedToMempool(
-            fbb, PluginInterface::CreateTx(
-                     fbb, fbb.CreateVector((uint8_t *)tx.data(), tx.size()))));
+            fbb, PluginInterface::CreateMempoolTx(fbb, CreateFbsTx(fbb, ptx))));
         BroadcastMessage("mempooltxadd", fbb);
     }
 
     void TransactionRemovedFromMempool(const CTransactionRef &ptx) override {
         flatbuffers::FlatBufferBuilder fbb;
         fbb.Finish(PluginInterface::CreateTransactionRemovedFromMempool(
-            fbb, fbb.CreateVector(ptx->GetId().begin(), ptx->GetId().size())));
+            fbb, CreateFbsTxId(fbb, ptx->GetId())));
         BroadcastMessage("mempooltxrem", fbb);
     }
 
@@ -405,12 +610,10 @@ private:
                    const std::vector<CTransactionRef> &txnConflicted) override {
         flatbuffers::FlatBufferBuilder fbb;
         auto block_fb = CreateFbsBlock(fbb, *block);
-        std::vector<PluginInterface::Txid> txs_conflicted;
+        std::vector<flatbuffers::Offset<PluginInterface::TxId>> txs_conflicted;
         for (const CTransactionRef &conflicted_tx : txnConflicted) {
-            PluginInterface::Txid txid;
-            memcpy(txid.mutable_id()->Data(), conflicted_tx->GetId().begin(),
-                   conflicted_tx->GetId().size());
-            txs_conflicted.push_back(txid);
+            txs_conflicted.push_back(
+                CreateFbsTxId(fbb, conflicted_tx->GetId()));
         }
         fbb.Finish(PluginInterface::CreateBlockConnectedDirect(
             fbb, block_fb, &txs_conflicted));
@@ -421,8 +624,7 @@ private:
     BlockDisconnected(const std::shared_ptr<const CBlock> &block) override {
         flatbuffers::FlatBufferBuilder fbb;
         fbb.Finish(PluginInterface::CreateBlockDisconnected(
-            fbb, fbb.CreateVector(block->GetHash().begin(),
-                                  block->GetHash().size())));
+            fbb, CreateFbsBlockHash(fbb, block->GetHash())));
         BroadcastMessage("blkdisconctd", fbb);
     }
 
@@ -431,9 +633,8 @@ private:
             return;
         }
         flatbuffers::FlatBufferBuilder fbb;
-        BlockHash blockhash = locator.vHave[0];
         fbb.Finish(PluginInterface::CreateBlockDisconnected(
-            fbb, fbb.CreateVector(blockhash.begin(), blockhash.size())));
+            fbb, CreateFbsBlockHash(fbb, locator.vHave[0])));
         BroadcastMessage("chainstflush", fbb);
     }
 
@@ -449,8 +650,7 @@ private:
             state = PluginInterface::BlockValidationModeState_Error;
         }
         fbb.Finish(PluginInterface::CreateBlockChecked(
-            fbb,
-            fbb.CreateVector(block.GetHash().begin(), block.GetHash().size()),
+            fbb, CreateFbsBlockHash(fbb, block.GetHash()),
             PluginInterface::CreateBlockValidationState(
                 fbb, state,
                 fbb.CreateString(validation_state.GetRejectReason()),
@@ -461,10 +661,8 @@ private:
     void NewPoWValidBlock(const CBlockIndex *pindex,
                           const std::shared_ptr<const CBlock> &block) override {
         flatbuffers::FlatBufferBuilder fbb;
-        CDataStream header(SER_NETWORK, PROTOCOL_VERSION);
-        header << block->GetBlockHeader();
-        fbb.Finish(PluginInterface::CreateUpdatedBlockTip(
-            fbb, fbb.CreateVector((uint8_t *)header.data(), header.size())));
+        fbb.Finish(PluginInterface::CreateNewPoWValidBlock(
+            fbb, CreateFbsBlockHeader(fbb, block->GetBlockHeader())));
         BroadcastMessage("newpowvldblk", fbb);
     }
 };

@@ -24,7 +24,6 @@ if(BUILD_BITCOIN_PLUGIN_NNG)
     ARGS -o "${genflatbuf_folder}"
       --cpp
       --python
-      --gen-mutable
       "${flatbuffers_file}"
     DEPENDS "${flatbuffers_file}")
 
@@ -34,6 +33,7 @@ if(BUILD_BITCOIN_PLUGIN_NNG)
   # Include generated *.pb.h files
   include_directories("${genflatbuf_folder}")
   include_directories("..")
+  include_directories("../univalue/include")
 
   find_package(Boost 1.58 REQUIRED filesystem)
 

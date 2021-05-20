@@ -1,20 +1,12 @@
 namespace PluginInterface;
 
-table MessageSubscribeTo {
-    updated_block_tip: bool;
-    transaction_added_to_mempool: bool;
-    transaction_removed_from_mempool: bool;
-    block_connected: bool;
-    block_disconnected: bool;
-    chain_state_flushed: bool;
-    block_checked: bool;
-    new_pow_valid_block: bool;
-}
-
 union RpcCallType {
     GetBlockRequest,
     GetBlockUndoDataRequest,
     GetMempoolRequest,
+    GetBlockchainInfoRequest,
+    SubmitBlockRequest,
+    SubmitTxRequest,
 }
 
 table RpcResult {
@@ -29,15 +21,32 @@ table RpcCall {
 }
 
 table Tx {
+    txid: TxId;
     raw: [ubyte];
 }
 
-struct Txid {
-    id: [ubyte: 32];
+table TxId {
+    id: [ubyte];
+}
+
+table BlockHeight {
+    height: int32;
+}
+
+table BlockHash {
+    hash: [ubyte];
+}
+
+table BlockHeader {
+    raw: [ubyte];
+    hash: BlockHash;
+    prev_hash: BlockHash;
+    n_bits: uint32;
+    timestamp: uint64;
 }
 
 table Block {
-    header: [ubyte];
+    header: BlockHeader;
     metadata: [BlockMetadata];
     txs: [Tx];
 }
@@ -49,22 +58,22 @@ table Coin {
     is_coinbase: bool;
 }
 
+table TxUndo {
+    coins: [Coin];
+}
+
+table MempoolTx {
+    tx: Tx;
+}
+
 table BlockMetadata {
     field_id: uint32;
     field_value: [ubyte];
 }
 
-table BlockHeight {
-    height: int32;
-}
-
-table BlockHash {
-    blockhash: [ubyte];
-}
-
 union BlockIdentifier {
     Height: BlockHeight,
-    Blockhash: BlockHash,
+    Hash: BlockHash,
 }
 
 // Notifies listeners when the block chain tip advances.
@@ -74,13 +83,13 @@ union BlockIdentifier {
 // If the latter behavior is desired, subscribe to BlockConnected instead.
 table UpdatedBlockTip {
     // Hash of the block that's now tip
-    blockhash: [ubyte];
+    block_hash: BlockHash;
 }
 
 // Notifies listeners of a transaction having been added to mempool.
 table TransactionAddedToMempool {
     // Encoded transaction
-    tx: Tx;
+    mempool_tx: MempoolTx;
 }
 
 // Notifies listeners of a transaction leaving mempool.
@@ -99,19 +108,19 @@ table TransactionAddedToMempool {
 // in transactions removed from the mempool for inclusion in a block can
 // learn about those transactions from the BlockConnected notification.
 table TransactionRemovedFromMempool {
-    txid: [ubyte];
+    txid: TxId;
 }
 
 // Notifies listeners of a block being connected.
 // Provides a vector of transactions evicted from the mempool as a result.
 table BlockConnected {
     block: Block;
-    txs_conflicted: [Txid];
+    txs_conflicted: [TxId];
 }
 
 // Notifies listeners of a block being disconnected
 table BlockDisconnected {
-    blockhash: [ubyte];
+    block_hash: BlockHash;
 }
 
 // Notifies listeners of the new active block chain on-disk.
@@ -127,7 +136,7 @@ table BlockDisconnected {
 // Provides a locator describing the best chain, which is likely useful for
 // storing current state on disk in client DBs.
 table ChainStateFlushed {
-    blockhash: [ubyte];
+    block_hash: BlockHash;
 }
 
 // Notifies listeners of a block validation result.
@@ -135,7 +144,7 @@ table ChainStateFlushed {
 // is guaranteed to be the current best block at the time the
 // callback was generated (not necessarily now)
 table BlockChecked {
-    blockhash: [ubyte];
+    block_hash: BlockHash;
     validation_state: BlockValidationState;
 }
 
@@ -155,7 +164,7 @@ table BlockValidationState {
 // has been received and connected to the headers tree, though not validated
 // yet.
 table NewPoWValidBlock {
-    blockheader: [ubyte];
+    block_header: BlockHeader;
 }
 
 table GetBlockRequest {
@@ -171,7 +180,7 @@ table GetBlockUndoDataRequest {
 }
 
 table GetBlockUndoDataResponse {
-    coins: [Coin]; 
+    tx_undos: [TxUndo]; 
 }
 
 table GetMempoolRequest {}
@@ -180,6 +189,34 @@ table GetMempoolResponse {
     txs: [MempoolTx];
 }
 
-table MempoolTx {
-    tx: [ubyte];
+table GetBlockchainInfoRequest {}
+
+table GetBlockchainInfoResponse {
+    chain: string;
+    block_height: int32;
+    best_block_hash: BlockHash;
+    is_pruned: bool;
+    is_initial_block_download: bool;
+    verification_progress: float64;
+}
+
+table SubmitBlockRequest {
+    raw_block: [ubyte];
+}
+
+table SubmitBlockResponse {
+    is_accepted: bool;
+    state: string;
+    reject_reason: string;
+}
+
+table SubmitTxRequest {
+    raw_tx: [ubyte];
+    allow_high_fees: bool;
+}
+
+table SubmitTxResponse {
+    is_accepted: bool;
+    reject_reason: string;
+    txid: TxId;
 }
