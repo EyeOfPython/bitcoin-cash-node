@@ -109,6 +109,9 @@ class PluginRpcServer {
     RpcErrorCode GetBlock(flatbuffers::FlatBufferBuilder &builder,
                           const PluginInterface::GetBlockRequest *request);
     RpcErrorCode
+    GetBlockRange(flatbuffers::FlatBufferBuilder &builder,
+                  const PluginInterface::GetBlockRangeRequest *request);
+    RpcErrorCode
     GetBlockUndoData(flatbuffers::FlatBufferBuilder &builder,
                      const PluginInterface::GetBlockUndoDataRequest *request);
     RpcErrorCode GetMempool(flatbuffers::FlatBufferBuilder &builder,
@@ -221,6 +224,9 @@ RpcErrorCode PluginRpcServer::HandleMsg(flatbuffers::FlatBufferBuilder &fbb,
     switch (rpc->rpc_type()) {
         case PluginInterface::RpcCallType_GetBlockRequest: {
             return GetBlock(fbb, rpc->rpc_as_GetBlockRequest());
+        }
+        case PluginInterface::RpcCallType_GetBlockRangeRequest: {
+            return GetBlockRange(fbb, rpc->rpc_as_GetBlockRangeRequest());
         }
         case PluginInterface::RpcCallType_GetBlockUndoDataRequest: {
             return GetBlockUndoData(fbb, rpc->rpc_as_GetBlockUndoDataRequest());
@@ -346,6 +352,44 @@ PluginRpcServer::GetBlock(flatbuffers::FlatBufferBuilder &fbb,
     return RpcErrorCode::NO_ERROR;
 }
 
+RpcErrorCode PluginRpcServer::GetBlockRange(
+    flatbuffers::FlatBufferBuilder &fbb,
+    const PluginInterface::GetBlockRangeRequest *request) {
+    LOCK(cs_main);
+
+    const int32_t chain_height = ::ChainActive().Height();
+    const int32_t start_height = request->start_height();
+    uint32_t num_blocks = request->num_blocks();
+    int32_t end_height = start_height + num_blocks - 1;
+    if (end_height > chain_height) {
+        end_height = chain_height;
+        num_blocks = end_height - start_height;
+    }
+
+    CBlockIndex *block_index = nullptr;
+    if (start_height >= 0) {
+        block_index = ::ChainActive().Tip()->GetAncestor(end_height);
+    } else {
+        num_blocks = 0;
+    }
+    std::vector<flatbuffers::Offset<PluginInterface::Block>> blocks_fbs(
+        num_blocks);
+    for (auto block_fbs = blocks_fbs.rbegin();
+         block_fbs != blocks_fbs.rend() && block_index != nullptr;
+         ++block_fbs) {
+        CBlock block;
+        if (!ReadBlockFromDisk(block, block_index,
+                               m_config.GetChainParams().GetConsensus())) {
+            return RpcErrorCode::BLOCK_DATA_CORRUPTED;
+        }
+        *block_fbs = CreateFbsBlock(fbb, block);
+        block_index = block_index->pprev;
+    }
+    fbb.Finish(PluginInterface::CreateGetBlockRangeResponse(
+        fbb, fbb.CreateVector(blocks_fbs)));
+    return RpcErrorCode::NO_ERROR;
+}
+
 RpcErrorCode PluginRpcServer::GetBlockUndoData(
     flatbuffers::FlatBufferBuilder &fbb,
     const PluginInterface::GetBlockUndoDataRequest *request) {
@@ -404,6 +448,7 @@ PluginRpcServer::GetMempool(flatbuffers::FlatBufferBuilder &fbb,
 RpcErrorCode PluginRpcServer::GetBlockchainInfo(
     flatbuffers::FlatBufferBuilder &fbb,
     const PluginInterface::GetBlockchainInfoRequest *request) {
+    LOCK(cs_main);
     const CBlockIndex *tip = ::ChainActive().Tip();
 
     fbb.Finish(PluginInterface::CreateGetBlockchainInfoResponse(

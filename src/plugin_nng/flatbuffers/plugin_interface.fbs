@@ -2,6 +2,7 @@ namespace PluginInterface;
 
 union RpcCallType {
     GetBlockRequest,
+    GetBlockRangeRequest,
     GetBlockUndoDataRequest,
     GetMempoolRequest,
     GetBlockchainInfoRequest,
@@ -173,6 +174,15 @@ table GetBlockRequest {
 
 table GetBlockResponse {
     block: Block;
+}
+
+table GetBlockRangeRequest {
+    start_height: int32;
+    num_blocks: uint32;
+}
+
+table GetBlockRangeResponse {
+    blocks: [Block];
 }
 
 table GetBlockUndoDataRequest {

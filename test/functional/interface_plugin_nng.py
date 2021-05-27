@@ -69,6 +69,7 @@ class PluginGRPCTest(BitcoinTestFramework):
             await self._tests_get_block_undo_data_errors(rpc_sock)
             await self._tests_blockchain_info(node, rpc_sock)
             await self._tests_send_tx(node, rpc_sock)
+            await self._test_get_block_range(node, rpc_sock)
             await self._test_submit_block(node, rpc_sock)
             await self._test_submit_tx(node, rpc_sock)
         with pynng.Sub0() as pub_sock:
@@ -112,6 +113,28 @@ class PluginGRPCTest(BitcoinTestFramework):
         RpcCall.RpcCallStart(fbb)
         RpcCall.RpcCallAddRpcType(fbb, RpcCallType.RpcCallType.GetBlockRequest)
         RpcCall.RpcCallAddRpc(fbb, get_block_request)
+        rpc = RpcCall.RpcCallEnd(fbb)
+        fbb.Finish(rpc)
+        return bytes(fbb.Output())
+
+    def _make_get_block_range_request_fbb(self, start_height, num_blocks):
+        from PluginInterface import (
+            RpcCall,
+            RpcCallType,
+            GetBlockRangeRequest,
+            BlockIdentifier,
+            BlockHeight,
+            BlockHash,
+        )
+        import flatbuffers
+        fbb = flatbuffers.Builder()
+        GetBlockRangeRequest.Start(fbb)
+        GetBlockRangeRequest.AddStartHeight(fbb, start_height)
+        GetBlockRangeRequest.AddNumBlocks(fbb, num_blocks)
+        get_block_request = GetBlockRangeRequest.End(fbb)
+        RpcCall.Start(fbb)
+        RpcCall.AddRpcType(fbb, RpcCallType.RpcCallType.GetBlockRangeRequest)
+        RpcCall.AddRpc(fbb, get_block_request)
         rpc = RpcCall.RpcCallEnd(fbb)
         fbb.Finish(rpc)
         return bytes(fbb.Output())
@@ -396,6 +419,28 @@ class PluginGRPCTest(BitcoinTestFramework):
         assert_equal(get_fb_bytes(coin, 'Script').hex(), CScript([OP_HASH160, hash160(b'\x51'), OP_EQUAL]).hex())
         assert_equal(coin.Height(), 1)
         assert_equal(coin.IsCoinbase(), True)
+
+    async def _test_get_block_range(self, node, rpc_sock):
+        from PluginInterface import GetBlockRangeResponse
+        for start_height, num_blocks in [(0, 10), (10, 30), (100, 5)]:
+            await self._send_request(rpc_sock, self._make_get_block_range_request_fbb(start_height, num_blocks))
+            response = await self._recv_response(rpc_sock)
+            response = GetBlockRangeResponse.GetBlockRangeResponse.GetRootAs(response, 0)
+            assert_equal(response.BlocksLength(), num_blocks)
+            for idx in range(num_blocks):
+                block_hash = node.getblockhash(start_height + idx)
+                block = response.Blocks(idx)
+                assert_equal(get_fb_bytes(block.Header().Hash(), 'Hash')[::-1].hex(), block_hash)
+        # negative index -> empty list
+        await self._send_request(rpc_sock, self._make_get_block_range_request_fbb(-1, 4))
+        response = await self._recv_response(rpc_sock)
+        response = GetBlockRangeResponse.GetBlockRangeResponse.GetRootAs(response, 0)
+        assert_equal(response.BlocksLength(), 0)
+        # too many blocks -> rest cut off
+        await self._send_request(rpc_sock, self._make_get_block_range_request_fbb(100, 30))
+        response = await self._recv_response(rpc_sock)
+        response = GetBlockRangeResponse.GetBlockRangeResponse.GetRootAs(response, 0)
+        assert_equal(response.BlocksLength(), 11)
 
     async def _test_submit_block(self, node, rpc_sock):
         from PluginInterface.SubmitBlockResponse import SubmitBlockResponse
