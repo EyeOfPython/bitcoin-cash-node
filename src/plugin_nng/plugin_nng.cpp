@@ -363,7 +363,7 @@ RpcErrorCode PluginRpcServer::GetBlockRange(
     int32_t end_height = start_height + num_blocks - 1;
     if (end_height > chain_height) {
         end_height = chain_height;
-        num_blocks = end_height - start_height;
+        num_blocks = end_height - start_height + 1;
     }
 
     CBlockIndex *block_index = nullptr;
