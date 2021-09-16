@@ -4,7 +4,7 @@ project(plugin_nng)
 if(BUILD_BITCOIN_PLUGIN_NNG)
   find_package(nng CONFIG REQUIRED)
 
-  find_package(flatbuffers CONFIG REQUIRED)
+  find_package(Flatbuffers CONFIG REQUIRED)
   find_program(_FLATC flatc)
 
   message(STATUS "Using flatc executable ${_FLATC}")
