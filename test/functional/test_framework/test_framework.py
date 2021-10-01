@@ -159,6 +159,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             config['environment']['BUILDDIR'] + os.path.sep + "qt" + os.pathsep + \
             os.environ['PATH']
 
+        sys.path.append(config["environment"]["BUILDDIR"] + '/src/plugin_nng')
+
         # Set up temp directory and start logging
         if self.options.tmpdir:
             self.options.tmpdir = os.path.abspath(self.options.tmpdir)
@@ -576,10 +578,29 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         except ImportError:
             raise SkipTest("python3-zmq module not available.")
 
+    def skip_if_no_py3_pynng(self):
+        """Attempt to import the pynng package and skip the test if the import fails."""
+        try:
+            import pynng  # noqa
+        except ImportError:
+            raise SkipTest("pynng module not available.")
+
+    def skip_if_no_py3_flatbuffers(self):
+        """Attempt to import the flatbuffers package and skip the test if the import fails."""
+        try:
+            import flatbuffers  # noqa
+        except ImportError:
+            raise SkipTest("flatbuffers module not available.")
+
     def skip_if_no_bitcoind_zmq(self):
         """Skip the running test if bitcoind has not been compiled with zmq support."""
         if not self.is_zmq_compiled():
             raise SkipTest("bitcoind has not been built with zmq enabled.")
+
+    def skip_if_no_bitcoind_plugin_interface(self):
+        """Skip the running test if bitcoind has not been compiled with plugin interface support."""
+        if not self.is_plugin_interface_compiled():
+            raise SkipTest("bitcoind has not been built with plugin interface support endabled.")
 
     def skip_if_no_wallet(self):
         """Skip the running test if wallet has not been compiled."""
@@ -611,3 +632,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         config.read_file(open(self.options.configfile, encoding='utf-8'))
 
         return config["components"].getboolean("ENABLE_ZMQ")
+
+    def is_plugin_interface_compiled(self):
+        """Checks whether the plugin inferface module was compiled."""
+        config = configparser.ConfigParser()
+        config.read_file(open(self.options.configfile, encoding='utf-8'))
+        return config["components"].getboolean("ENABLE_PLUGIN_NNG")

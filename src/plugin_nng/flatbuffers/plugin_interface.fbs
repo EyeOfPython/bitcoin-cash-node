@@ -1,0 +1,232 @@
+namespace PluginInterface;
+
+union RpcCallType {
+    GetBlockRequest,
+    GetBlockRangeRequest,
+    GetBlockUndoDataRequest,
+    GetMempoolRequest,
+    GetBlockchainInfoRequest,
+    SubmitBlockRequest,
+    SubmitTxRequest,
+}
+
+table RpcResult {
+    is_success: bool;
+    error_code: int32;
+    error_msg: string;
+    data: [ubyte];
+}
+
+table RpcCall {
+    rpc: RpcCallType;
+}
+
+table Tx {
+    txid: TxId;
+    raw: [ubyte];
+}
+
+table TxId {
+    id: [ubyte];
+}
+
+table BlockHeight {
+    height: int32;
+}
+
+table BlockHash {
+    hash: [ubyte];
+}
+
+table BlockHeader {
+    raw: [ubyte];
+    hash: BlockHash;
+    prev_hash: BlockHash;
+    n_bits: uint32;
+    timestamp: uint64;
+}
+
+table Block {
+    header: BlockHeader;
+    metadata: [BlockMetadata];
+    txs: [Tx];
+}
+
+table Coin {
+    amount: uint64;
+    script: [ubyte];
+    height: int32;
+    is_coinbase: bool;
+}
+
+table TxUndo {
+    coins: [Coin];
+}
+
+table MempoolTx {
+    tx: Tx;
+}
+
+table BlockMetadata {
+    field_id: uint32;
+    field_value: [ubyte];
+}
+
+union BlockIdentifier {
+    Height: BlockHeight,
+    Hash: BlockHash,
+}
+
+// Notifies listeners when the block chain tip advances.
+//
+// When multiple blocks are connected at once, UpdatedBlockTip will be
+// sent on the final tip but may not be sent on every intermediate tip.
+// If the latter behavior is desired, subscribe to BlockConnected instead.
+table UpdatedBlockTip {
+    // Hash of the block that's now tip
+    block_hash: BlockHash;
+}
+
+// Notifies listeners of a transaction having been added to mempool.
+table TransactionAddedToMempool {
+    // Encoded transaction
+    mempool_tx: MempoolTx;
+}
+
+// Notifies listeners of a transaction leaving mempool.
+//
+// This notification gets sent for transactions that are removed from the
+// mempool for the following reasons:
+//
+// - EXPIRY (expired from mempool after -mempoolexpiry hours)
+// - SIZELIMIT (removed in size limiting if the mempool exceeds -maxmempool
+//   megabytes)
+// - REORG (removed during a reorg)
+//
+// This does not get sent for transactions that are removed from the mempool
+// because they have been included in a block, nor for transaction that get
+// removed for conflicting with a new block. Any client that is interested
+// in transactions removed from the mempool for inclusion in a block can
+// learn about those transactions from the BlockConnected notification.
+table TransactionRemovedFromMempool {
+    txid: TxId;
+}
+
+// Notifies listeners of a block being connected.
+// Provides a vector of transactions evicted from the mempool as a result.
+table BlockConnected {
+    block: Block;
+    txs_conflicted: [TxId];
+}
+
+// Notifies listeners of a block being disconnected
+table BlockDisconnected {
+    block_hash: BlockHash;
+}
+
+// Notifies listeners of the new active block chain on-disk.
+//
+// Prior to this message, any updates are not guaranteed to persist on disk
+// (ie clients need to handle shutdown/restart safety by being able to
+// understand when some updates were lost due to unclean shutdown).
+//
+// When this message is sent, the validation changes done by any prior
+// message are guaranteed to exist on disk and survive a restart, including
+// an unclean shutdown.
+//
+// Provides a locator describing the best chain, which is likely useful for
+// storing current state on disk in client DBs.
+table ChainStateFlushed {
+    block_hash: BlockHash;
+}
+
+// Notifies listeners of a block validation result.
+// If the provided BlockValidationState IsValid, the provided block
+// is guaranteed to be the current best block at the time the
+// callback was generated (not necessarily now)
+table BlockChecked {
+    block_hash: BlockHash;
+    validation_state: BlockValidationState;
+}
+
+enum BlockValidationModeState : uint8 {
+    Valid,
+    Invalid,
+    Error,
+}
+
+table BlockValidationState {
+    state: BlockValidationModeState;
+    reject_reason: string;
+    debug_msg: string;
+}
+
+// Notifies listeners that a block which builds directly on our current tip
+// has been received and connected to the headers tree, though not validated
+// yet.
+table NewPoWValidBlock {
+    block_header: BlockHeader;
+}
+
+table GetBlockRequest {
+    block_id: BlockIdentifier;
+}
+
+table GetBlockResponse {
+    block: Block;
+}
+
+table GetBlockRangeRequest {
+    start_height: int32;
+    num_blocks: uint32;
+}
+
+table GetBlockRangeResponse {
+    blocks: [Block];
+}
+
+table GetBlockUndoDataRequest {
+    block_id: BlockIdentifier;
+}
+
+table GetBlockUndoDataResponse {
+    tx_undos: [TxUndo]; 
+}
+
+table GetMempoolRequest {}
+
+table GetMempoolResponse {
+    txs: [MempoolTx];
+}
+
+table GetBlockchainInfoRequest {}
+
+table GetBlockchainInfoResponse {
+    chain: string;
+    block_height: int32;
+    best_block_hash: BlockHash;
+    is_pruned: bool;
+    is_initial_block_download: bool;
+    verification_progress: float64;
+}
+
+table SubmitBlockRequest {
+    raw_block: [ubyte];
+}
+
+table SubmitBlockResponse {
+    is_accepted: bool;
+    state: string;
+    reject_reason: string;
+}
+
+table SubmitTxRequest {
+    raw_tx: [ubyte];
+    allow_high_fees: bool;
+}
+
+table SubmitTxResponse {
+    is_accepted: bool;
+    reject_reason: string;
+    txid: TxId;
+}

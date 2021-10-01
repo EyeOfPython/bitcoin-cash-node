@@ -125,6 +125,7 @@ enum class OptionsCategory {
     GUI,
     COMMANDS,
     REGISTER_COMMANDS,
+    PLUGIN_INTERFACE,
 
     // Always the last option to avoid printing these in the help
     HIDDEN,

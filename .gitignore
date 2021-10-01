@@ -99,6 +99,7 @@ qrc_*.cpp
 # Mac specific
 .DS_Store
 build
+build2
 
 #lcov
 *.gcno
@@ -138,3 +139,6 @@ nbproject/
 .cproject
 .project
 .pydevproject
+
+# Local Development Environment - VSCode
+.vscode

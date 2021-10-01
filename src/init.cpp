@@ -37,6 +37,7 @@
 #include <netbase.h>
 #include <policy/mempool.h>
 #include <policy/policy.h>
+#include <plugin_nng/plugin_nng.h>
 #include <rpc/blockchain.h>
 #include <rpc/register.h>
 #include <rpc/server.h>
@@ -240,6 +241,8 @@ void Shutdown(NodeContext &node) {
     if (g_txindex) {
         g_txindex->Stop();
     }
+
+    StopPluginNng();
 
     StopTorControl();
 
@@ -1153,6 +1156,18 @@ void SetupServerArgs() {
                  strprintf("Timeout during HTTP requests (default: %d)",
                            DEFAULT_HTTP_SERVER_TIMEOUT),
                  true, OptionsCategory::RPC);
+    gArgs.AddArg(
+        "-pluginrpcurl=<url>",
+        "Bind to given url to listen for NNG plugin RPC connections. URL "
+        "has to be prefixed by tcp:// or ipc://, which also "
+        "determines the transport that will be used",
+        false, OptionsCategory::PLUGIN_INTERFACE);
+    gArgs.AddArg(
+        "-pluginpuburl=<url>",
+        "Bind to given url to listen for NNG plugin Pubsub connections. URL "
+        "has to be prefixed by tcp:// or ipc://, which also "
+        "determines the transport that will be used",
+        false, OptionsCategory::PLUGIN_INTERFACE);
 
 #if HAVE_DECL_DAEMON
     gArgs.AddArg("-daemon",
@@ -2649,6 +2664,8 @@ bool AppInitMain(Config &config, RPCServer &rpcServer,
         g_txindex = std::make_unique<TxIndex>(nTxIndexCache, false, fReindex);
         g_txindex->Start();
     }
+
+    StartPluginNng();
 
     // Step 9: load wallet
     for (const auto &client : node.chain_clients) {
